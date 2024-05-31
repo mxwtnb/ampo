@@ -24,8 +24,11 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         deployMintAndApprove2Currencies();
 
         // Deploy our hook
-        address hookAddress = address(uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG));
+        address hookAddress = address(
+            uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG)
+        );
         deployCodeTo("AuctionManagedOptionsHook.sol", abi.encode(manager), hookAddress);
+        hook = AuctionManagedOptionsHook(hookAddress);
 
         // Initialize a pool with zero fee
         key = PoolKey(currency0, currency1, 0, int24(60), hook);
@@ -37,6 +40,12 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
             IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 100 ether, salt: 0}),
             ZERO_BYTES
         );
+    }
+
+    function test_SwapFeeShouldBeZero() public {
+        PoolKey memory key_ = PoolKey(currency0, currency1, 100, int24(60), hook);
+        vm.expectRevert(AuctionManagedOptionsHook.SwapFeeNotZero.selector);
+        manager.initialize(key_, SQRT_PRICE_1_1, ZERO_BYTES);
     }
 
     function test_Swap() public {
