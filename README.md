@@ -1,0 +1,1 @@
+# auction-managed-options-hook
