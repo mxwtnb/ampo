@@ -60,12 +60,15 @@ contract AuctionManagedOptionsHook is BaseHook {
         // TODO: Fee is currency hardcoded. Use manager-set fee instead.
         int128 feeDelta = int128(params.amountSpecified) / 50;
         uint256 feeAmount = uint256(int256(feeDelta > 0 ? feeDelta : -feeDelta));
-
         BeforeSwapDelta bsd = toBeforeSwapDelta(-feeDelta, int128(0));
 
+        // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
+        // so the currencySpecified should be the token the swapper is selling.
+        // If amountSpecified > 0, the swap is exact-out and it's the bought token.
+        Currency currencySpecified = (params.amountSpecified > 0) != params.zeroForOne ? key.currency0 : key.currency1;
+
         // TODO: Redirect fee to manager
-        Currency feeCurrency = params.zeroForOne != (params.amountSpecified > 0) ? key.currency0 : key.currency1;
-        feeCurrency.take(poolManager, address(this), feeAmount, true);
+        currencySpecified.take(poolManager, address(this), feeAmount, true);
         return (this.beforeSwap.selector, bsd, 0);
     }
 }
