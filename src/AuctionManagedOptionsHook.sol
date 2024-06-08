@@ -59,16 +59,16 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @notice Revert if swap fee is not set to zero. Swap fee should be zero
     /// as we instead charge a fee in `beforeSwap` and send it to the manager.
     // TODO: Take lower and upper prices for the fixed range
-    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
+    function beforeInitialize(address, PoolKey calldata pk, uint160, bytes calldata)
         external
         override
         returns (bytes4)
     {
-        if (key.fee != 0) revert SwapFeeNotZero();
+        if (pk.fee != 0) revert SwapFeeNotZero();
         return this.beforeInitialize.selector;
     }
 
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
+    function beforeSwap(address, PoolKey calldata pk, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -82,15 +82,15 @@ contract AuctionManagedOptionsHook is BaseHook {
         // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
         // so the currencySpecified should be the token the swapper is selling.
         // If amountSpecified > 0, the swap is exact-out and it's the bought token.
-        Currency currencySpecified = (params.amountSpecified > 0) != params.zeroForOne ? key.currency0 : key.currency1;
+        Currency currencySpecified = (params.amountSpecified > 0) != params.zeroForOne ? pk.currency0 : pk.currency1;
 
         // TODO: Redirect fee to manager
         currencySpecified.take(poolManager, address(this), feeAmount, true);
         return (this.beforeSwap.selector, bsd, 0);
     }
 
-    function modifyBid(PoolKey calldata key, uint256 rent) external {
-        PoolId poolId = key.toId();
+    function modifyBid(PoolKey calldata pk, uint256 rent) external {
+        PoolId poolId = pk.toId();
         if (deposits[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
             revert NotEnoughDeposit();
         }
@@ -107,12 +107,12 @@ contract AuctionManagedOptionsHook is BaseHook {
         }
     }
 
-    function deposit(PoolKey calldata key) external payable {
-        deposits[key.toId()][msg.sender] += msg.value;
+    function deposit(PoolKey calldata pk) external payable {
+        deposits[pk.toId()][msg.sender] += msg.value;
     }
 
-    function withdraw(PoolKey calldata key, uint256 amount) external {
-        PoolId poolId = key.toId();
+    function withdraw(PoolKey calldata pk, uint256 amount) external {
+        PoolId poolId = pk.toId();
         if (
             msg.sender == managers[poolId] && deposits[poolId][msg.sender] - amount < rents[poolId] * MIN_DEPOSIT_PERIOD
         ) {
@@ -120,5 +120,29 @@ contract AuctionManagedOptionsHook is BaseHook {
         }
 
         deposits[poolId][msg.sender] -= amount;
+    }
+
+    /// @notice Charge rent to the current manager of the given pool
+    // TODO: add tests for this method
+    function _chargeRent(PoolKey calldata pk) internal {
+        PoolId poolId = pk.toId();
+
+        // Skip if no manager
+        address manager = managers[poolId];
+        if (manager == address(0)) {
+            return;
+        }
+
+        uint256 timeSinceLastCharge = block.timestamp - lastRentChargeTimestamps[poolId];
+        uint256 rentOwed = rents[poolId] * timeSinceLastCharge;
+
+        // Manager is out of collateral so kick them out
+        if (deposits[poolId][manager] < rentOwed) {
+            rentOwed = deposits[poolId][manager];
+            managers[poolId] = address(0);
+        }
+
+        lastRentChargeTimestamps[poolId] = block.timestamp;
+        deposits[poolId][manager] -= rentOwed;
     }
 }
