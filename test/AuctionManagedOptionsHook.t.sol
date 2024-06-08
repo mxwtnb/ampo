@@ -4,6 +4,8 @@ pragma solidity ^0.8.25;
 import {Test} from "forge-std/Test.sol";
 import {console2} from "forge-std/console2.sol";
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {AuctionManagedOptionsHook} from "../src/AuctionManagedOptionsHook.sol";
@@ -33,16 +35,23 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         deployCodeTo("AuctionManagedOptionsHook.sol", abi.encode(manager), hookAddress);
         hook = AuctionManagedOptionsHook(hookAddress);
 
+        // Also approve hook to spend our tokens
+        IERC20(Currency.unwrap(currency0)).approve(hookAddress, type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(hookAddress, type(uint256).max);
+
         // Initialize a pool with zero fee
         key = PoolKey(currency0, currency1, 0, int24(60), hook);
-        manager.initialize(key, SQRT_PRICE_1_1, ZERO_BYTES);
+        AuctionManagedOptionsHook.PoolParams memory poolParams =
+            AuctionManagedOptionsHook.PoolParams({tickLower: -60, tickUpper: 60});
+        manager.initialize(key, SQRT_PRICE_1_1, abi.encode(poolParams));
 
         // Add some liquidity
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 100 ether, salt: 0}),
-            ZERO_BYTES
-        );
+        // modifyLiquidityRouter.modifyLiquidity(
+        //     key,
+        //     IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 100 ether, salt: 0}),
+        //     ZERO_BYTES
+        // );
+        hook.modifyLiquidity(key, 100 ether);
     }
 
     function test_SwapFeeShouldBeZero() public {

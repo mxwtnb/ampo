@@ -11,6 +11,7 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
@@ -25,23 +26,34 @@ contract AuctionManagedOptionsHook is BaseHook {
     using CurrencySettleTake for Currency;
     using PoolIdLibrary for PoolKey;
 
+    error CannotDepositDirectly();
+    error NotEnoughDeposit();
+    error SwapFeeNotZero();
+
+    struct PoolParams {
+        int24 tickLower;
+        int24 tickUpper;
+    }
+
+    struct ModifyLiquidityCallbackData {
+        PoolKey key;
+        address sender;
+        int256 liquidityDelta;
+    }
+
     uint256 public constant MIN_DEPOSIT_PERIOD = 300;
 
-    // TODO: Set range when creating pool
-    mapping(PoolId => int24) public tickLowers;
-    mapping(PoolId => int24) public tickUppers;
-
+    mapping(PoolId => PoolParams) public poolParams;
     mapping(PoolId => address) public managers;
     mapping(PoolId => uint256) public rents;
     mapping(PoolId => uint256) public lastRentChargeTimestamps;
 
+    // TODO: Rename to balanceOf?
+    // TODO: Add events on transfer/mint etc
     mapping(PoolId => mapping(address => uint256)) public balances;
+    mapping(PoolId => mapping(address => int256)) public liquidities;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
-
-    error CannotDepositDirectly();
-    error NotEnoughDeposit();
-    error SwapFeeNotZero();
 
     // TODO: Add beforeAddLiquidity and check range matches the hook's range
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -66,16 +78,17 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @notice Revert if swap fee is not set to zero. Swap fee should be zero
     /// as we instead charge a fee in `beforeSwap` and send it to the manager.
     // TODO: Take lower and upper prices for the fixed range
-    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
+    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata hookData)
         external
-        pure
         override
         returns (bytes4)
     {
         if (key.fee != 0) revert SwapFeeNotZero();
+        poolParams[key.toId()] = abi.decode(hookData, (PoolParams));
         return this.beforeInitialize.selector;
     }
 
+    // TODO: change to beforeModifyPosition?
     function beforeAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
         external
         pure
@@ -83,6 +96,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         returns (bytes4)
     {
         revert CannotDepositDirectly();
+        // return this.beforeAddLiquidity.selector;
     }
 
     function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
@@ -183,15 +197,13 @@ contract AuctionManagedOptionsHook is BaseHook {
         }
     }
 
-    struct CallbackData {
-        address sender;
-        PoolKey key;
-        int256 liquidityDelta;
-    }
-
     function modifyLiquidity(PoolKey memory key, int256 liquidityDelta) public payable returns (BalanceDelta delta) {
-        delta =
-            abi.decode(poolManager.unlock(abi.encode(CallbackData(msg.sender, key, liquidityDelta))), (BalanceDelta));
+        delta = abi.decode(
+            poolManager.unlock(abi.encode(ModifyLiquidityCallbackData(key, msg.sender, liquidityDelta))), (BalanceDelta)
+        );
+
+        // Make sure not negative
+        liquidities[key.toId()][msg.sender] = liquidities[key.toId()][msg.sender] + liquidityDelta;
 
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
@@ -201,12 +213,13 @@ contract AuctionManagedOptionsHook is BaseHook {
 
     function unlockCallback(bytes calldata rawData) external override returns (bytes memory) {
         require(msg.sender == address(poolManager));
-        CallbackData memory data = abi.decode(rawData, (CallbackData));
+        ModifyLiquidityCallbackData memory data = abi.decode(rawData, (ModifyLiquidityCallbackData));
         PoolId poolId = data.key.toId();
 
+        PoolParams memory pp = poolParams[poolId];
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
-            tickLower: tickLowers[poolId],
-            tickUpper: tickUppers[poolId],
+            tickLower: pp.tickLower,
+            tickUpper: pp.tickUpper,
             liquidityDelta: data.liquidityDelta,
             salt: ""
         });
@@ -215,10 +228,10 @@ contract AuctionManagedOptionsHook is BaseHook {
         int256 delta0 = delta.amount0();
         int256 delta1 = delta.amount1();
 
-        if (delta0 < 0) data.key.currency0.settle(poolManager, data.sender, uint256(-delta0), true);
-        if (delta1 < 0) data.key.currency1.settle(poolManager, data.sender, uint256(-delta1), true);
-        if (delta0 > 0) data.key.currency0.take(poolManager, data.sender, uint256(delta0), true);
-        if (delta1 > 0) data.key.currency1.take(poolManager, data.sender, uint256(delta1), true);
+        if (delta0 < 0) data.key.currency0.settle(poolManager, data.sender, uint256(-delta0), false);
+        if (delta1 < 0) data.key.currency1.settle(poolManager, data.sender, uint256(-delta1), false);
+        if (delta0 > 0) data.key.currency0.take(poolManager, data.sender, uint256(delta0), false);
+        if (delta1 > 0) data.key.currency1.take(poolManager, data.sender, uint256(delta1), false);
         return abi.encode(delta);
     }
 }
