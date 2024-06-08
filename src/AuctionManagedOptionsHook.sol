@@ -7,17 +7,36 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {CurrencySettleTake} from "v4-core/libraries/CurrencySettleTake.sol";
 import {BaseHook} from "v4-periphery/BaseHook.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
+/*
+
+
+
+*/
+
 contract AuctionManagedOptionsHook is BaseHook {
     using CurrencySettleTake for Currency;
+    using PoolIdLibrary for PoolKey;
+
+    struct Bid {
+        address manager;
+        uint256 rent;
+        uint256 timestamp;
+    }
+
+    uint256 public constant MIN_DEPOSIT_PERIOD = 300;
+    mapping(PoolId => Bid) public bids;
+    mapping(PoolId => mapping(address => uint256)) public deposits;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
 
     error SwapFeeNotZero();
+    error NotEnoughDeposit();
 
     // TODO: Add beforeAddLiquidity and check range matches the hook's range
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -70,5 +89,32 @@ contract AuctionManagedOptionsHook is BaseHook {
         // TODO: Redirect fee to manager
         currencySpecified.take(poolManager, address(this), feeAmount, true);
         return (this.beforeSwap.selector, bsd, 0);
+    }
+
+    function modifyBid(PoolKey calldata key, uint256 rent) external {
+        if (deposits[key.toId()][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
+            revert NotEnoughDeposit();
+        }
+
+        if (bids[key.toId()].manager == msg.sender) {
+            // Modify or cancel bid
+            bids[key.toId()].rent = rent;
+        } else if (rent > bids[key.toId()].rent) {
+            // Submit new highest bid
+            bids[key.toId()] = Bid(msg.sender, rent, block.timestamp);
+        }
+    }
+
+    function deposit(PoolKey calldata key) external payable {
+        deposits[key.toId()][msg.sender] += msg.value;
+    }
+
+    function withdraw(PoolKey calldata key, uint256 amount) external {
+        if (msg.sender == bids[key.toId()].manager && deposits[key.toId()][msg.sender] - amount < bids[key.toId()].rent * MIN_DEPOSIT_PERIOD)
+        {
+            revert NotEnoughDeposit();
+        }
+
+        deposits[key.toId()][msg.sender] -= amount;
     }
 }
