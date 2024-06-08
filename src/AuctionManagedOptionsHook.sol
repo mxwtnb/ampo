@@ -23,14 +23,12 @@ contract AuctionManagedOptionsHook is BaseHook {
     using CurrencySettleTake for Currency;
     using PoolIdLibrary for PoolKey;
 
-    struct Bid {
-        address manager;
-        uint256 rent;
-        uint256 timestamp;
-    }
-
     uint256 public constant MIN_DEPOSIT_PERIOD = 300;
-    mapping(PoolId => Bid) public bids;
+
+    mapping(PoolId => address) public managers;
+    mapping(PoolId => uint256) public rents;
+    mapping(PoolId => uint256) public lastRentChargeTimestamps;
+
     mapping(PoolId => mapping(address => uint256)) public deposits;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
@@ -92,16 +90,20 @@ contract AuctionManagedOptionsHook is BaseHook {
     }
 
     function modifyBid(PoolKey calldata key, uint256 rent) external {
-        if (deposits[key.toId()][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
+        PoolId poolId = key.toId();
+        if (deposits[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
             revert NotEnoughDeposit();
         }
 
-        if (bids[key.toId()].manager == msg.sender) {
+        if (managers[poolId] == msg.sender) {
             // Modify or cancel bid
-            bids[key.toId()].rent = rent;
-        } else if (rent > bids[key.toId()].rent) {
+            rents[poolId] = rent;
+        } else if (rent > rents[poolId]) {
             // Submit new highest bid
-            bids[key.toId()] = Bid(msg.sender, rent, block.timestamp);
+            // TODO: Make sure old manager is charged rent up to now
+            managers[poolId] = msg.sender;
+            rents[poolId] = rent;
+            lastRentChargeTimestamps[poolId] = block.timestamp;
         }
     }
 
@@ -110,11 +112,13 @@ contract AuctionManagedOptionsHook is BaseHook {
     }
 
     function withdraw(PoolKey calldata key, uint256 amount) external {
-        if (msg.sender == bids[key.toId()].manager && deposits[key.toId()][msg.sender] - amount < bids[key.toId()].rent * MIN_DEPOSIT_PERIOD)
-        {
+        PoolId poolId = key.toId();
+        if (
+            msg.sender == managers[poolId] && deposits[poolId][msg.sender] - amount < rents[poolId] * MIN_DEPOSIT_PERIOD
+        ) {
             revert NotEnoughDeposit();
         }
 
-        deposits[key.toId()][msg.sender] -= amount;
+        deposits[poolId][msg.sender] -= amount;
     }
 }
