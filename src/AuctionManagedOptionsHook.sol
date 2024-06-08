@@ -29,7 +29,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     mapping(PoolId => uint256) public rents;
     mapping(PoolId => uint256) public lastRentChargeTimestamps;
 
-    mapping(PoolId => mapping(address => uint256)) public deposits;
+    mapping(PoolId => mapping(address => uint256)) public balances;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
 
@@ -73,25 +73,32 @@ contract AuctionManagedOptionsHook is BaseHook {
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
+        address manager = managers[pk.toId()];
+
+        // If no manager is set, just pass fees to LPs like a vanilla uniswap pool
+        if (manager == address(0)) {
+            return (this.beforeSwap.selector, toBeforeSwapDelta(int128(0), int128(0)), 0);
+        }
+
         // Calculate swap fees. The fees don't go to LPs, they instead go to the manager of the pool
         // TODO: Fee is currency hardcoded. Use manager-set fee instead.
-        int128 feeDelta = int128(params.amountSpecified) / 50;
-        uint256 feeAmount = uint256(int256(feeDelta > 0 ? feeDelta : -feeDelta));
-        BeforeSwapDelta bsd = toBeforeSwapDelta(-feeDelta, int128(0));
+        int128 fees = int128(params.amountSpecified) / 50;
+        int128 absFees = fees > 0 ? fees : -fees;
 
         // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
-        // so the currencySpecified should be the token the swapper is selling.
+        // so the feeCurrency should be the token the swapper is selling.
         // If amountSpecified > 0, the swap is exact-out and it's the bought token.
-        Currency currencySpecified = (params.amountSpecified > 0) != params.zeroForOne ? pk.currency0 : pk.currency1;
+        bool exactOut = params.amountSpecified > 0;
+        Currency feeCurrency = exactOut != params.zeroForOne ? pk.currency0 : pk.currency1;
 
-        // TODO: Redirect fee to manager
-        currencySpecified.take(poolManager, address(this), feeAmount, true);
-        return (this.beforeSwap.selector, bsd, 0);
+        // Send fees to manager
+        feeCurrency.take(poolManager, manager, uint256(int256(absFees)), true);
+        return (this.beforeSwap.selector, toBeforeSwapDelta(-fees, int128(0)), 0);
     }
 
     function modifyBid(PoolKey calldata pk, uint256 rent) external {
         PoolId poolId = pk.toId();
-        if (deposits[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
+        if (balances[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
             revert NotEnoughDeposit();
         }
 
@@ -108,18 +115,18 @@ contract AuctionManagedOptionsHook is BaseHook {
     }
 
     function deposit(PoolKey calldata pk) external payable {
-        deposits[pk.toId()][msg.sender] += msg.value;
+        balances[pk.toId()][msg.sender] += msg.value;
     }
 
     function withdraw(PoolKey calldata pk, uint256 amount) external {
         PoolId poolId = pk.toId();
         if (
-            msg.sender == managers[poolId] && deposits[poolId][msg.sender] - amount < rents[poolId] * MIN_DEPOSIT_PERIOD
+            msg.sender == managers[poolId] && balances[poolId][msg.sender] - amount < rents[poolId] * MIN_DEPOSIT_PERIOD
         ) {
             revert NotEnoughDeposit();
         }
 
-        deposits[poolId][msg.sender] -= amount;
+        balances[poolId][msg.sender] -= amount;
     }
 
     /// @notice Charge rent to the current manager of the given pool
@@ -137,12 +144,25 @@ contract AuctionManagedOptionsHook is BaseHook {
         uint256 rentOwed = rents[poolId] * timeSinceLastCharge;
 
         // Manager is out of collateral so kick them out
-        if (deposits[poolId][manager] < rentOwed) {
-            rentOwed = deposits[poolId][manager];
+        if (balances[poolId][manager] < rentOwed) {
+            rentOwed = balances[poolId][manager];
             managers[poolId] = address(0);
         }
 
         lastRentChargeTimestamps[poolId] = block.timestamp;
-        deposits[poolId][manager] -= rentOwed;
+        balances[poolId][manager] -= rentOwed;
+    }
+
+    // TODO: add updateBalance() which calls this
+    function calcBalance(PoolKey calldata pk, address user) public view returns (uint256 balance) {
+        PoolId poolId = pk.toId();
+        balance = balances[poolId][user];
+
+        if (user == managers[poolId]) {
+            uint256 timeSinceLastCharge = block.timestamp - lastRentChargeTimestamps[poolId];
+            uint256 rentOwed = rents[poolId] * timeSinceLastCharge;
+            if (rentOwed > balance) rentOwed = balance;
+            balance -= rentOwed;
+        }
     }
 }
