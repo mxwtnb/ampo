@@ -25,7 +25,10 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
 
         // Deploy our hook
         address hookAddress = address(
-            uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG)
+            uint160(
+                Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+            )
         );
         deployCodeTo("AuctionManagedOptionsHook.sol", abi.encode(manager), hookAddress);
         hook = AuctionManagedOptionsHook(hookAddress);
