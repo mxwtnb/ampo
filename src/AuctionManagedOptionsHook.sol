@@ -20,8 +20,17 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 /**
  * @title   AuctionManagedOptionsHook
  * @author  mxwtnb
- * @notice  A Uniswap V4 hook that lets users open options positions. A continuous auction
- *          where managers bid and the highest bidder gets to set the funding rate.
+ * @notice  A Uniswap V4 hook that lets users trade perpetual options.
+ * 
+ *          Perpetual options are options that never expire and can be exercise at any point in the future.
+ *          They can be synthetically constructed by borrowing a narrow Uniswap concentrated liquidity
+ *          position, withdrawing it and swapping for one of the tokens if needed. Users with an open
+ *          perpetual options position have to pay funding each block, similar to funding on perpetual futures.
+ * 
+ *          The pricing of these options is auction-managed. A continuous auction is run
+ *          where anyone can bid for the right to change the funding rate and to receive funding from
+ *          open options positions. They are therefore incentivized to set it in a way that maximizes
+ *          their profit and the revenue that goes to LPs via the auction.
  */
 contract AuctionManagedOptionsHook is BaseHook {
     using CurrencyLibrary for Currency;
