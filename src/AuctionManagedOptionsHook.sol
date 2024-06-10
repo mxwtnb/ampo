@@ -64,6 +64,7 @@ contract AuctionManagedOptionsHook is BaseHook {
 
     /// @notice Period for which manager deposit needs to cover rent
     uint256 public constant MIN_DEPOSIT_PERIOD = 300;
+    uint256 public constant MIN_HEALTHY_PERIOD = 100;
 
     mapping(PoolId => PoolParams) public poolParams;
 
@@ -203,8 +204,10 @@ contract AuctionManagedOptionsHook is BaseHook {
             managerRent[poolId] = rent;
         } else if (rent > managerRent[poolId]) {
             // Submit new highest bid
-            _chargeRent(key);
-            _modifyOptionsPositionForUser(key, -positions[poolId][msg.sender].toInt256(), msg.sender);
+            address prevManager = optionManager[poolId];
+            _pokeUserBalance(key, prevManager);
+            _modifyOptionsPositionForUser(key, -positions[poolId][prevManager].toInt256(), prevManager);
+
             optionManager[poolId] = msg.sender;
             managerRent[poolId] = rent;
             lastRentBlock[poolId] = block.number;
@@ -258,6 +261,21 @@ contract AuctionManagedOptionsHook is BaseHook {
         balances[poolId][manager] -= rentOwed;
     }
 
+    function _pokeUserBalance(PoolKey calldata key, address user) internal returns (uint256 balance) {
+        PoolId poolId = key.toId();
+        balance = calcBalance(key, user);
+        balances[poolId][user] = balance;
+    }
+
+    function _pokeManagerBalance(PoolKey calldata key) internal {
+        PoolId poolId = key.toId();
+        address manager = optionManager[poolId];
+        _pokeUserBalance(key, manager);
+        if (manager != address(0) && balances[poolId][manager] == 0) {
+            optionManager[poolId] = address(0);
+        }
+    }
+
     // TODO: add updateBalance() which calls this
     // TODO: subtract funding payments from balance
     function calcBalance(PoolKey calldata key, address user) public view returns (uint256 balance) {
@@ -269,6 +287,11 @@ contract AuctionManagedOptionsHook is BaseHook {
             uint256 rentOwed = managerRent[poolId] * timeSinceLastCharge;
             if (rentOwed > balance) rentOwed = balance;
             balance -= rentOwed;
+        }
+
+        if (positions[poolId][user] > 0) {
+            uint256 funding = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
+            balance -= funding * positions[poolId][user];
         }
     }
 
@@ -364,6 +387,23 @@ contract AuctionManagedOptionsHook is BaseHook {
         );
     }
 
-    // TODO: Implement, using calcBalance
-    function liquidate(PoolKey calldata key, address user) external {}
+    function liquidate(PoolKey calldata key, address user) external {
+        uint256 balance = _pokeUserBalance(key, user);
+
+        uint256 paymentPerBlock = 0;
+        bool isManager = user == optionManager[key.toId()];
+        if (isManager) {
+            paymentPerBlock += managerRent[key.toId()];
+        }
+        if (positions[key.toId()][user] > 0) {
+            paymentPerBlock += currentFundingRate[key.toId()];
+        }
+
+        if (balance < paymentPerBlock * MIN_HEALTHY_PERIOD) {
+            if (isManager) {
+                optionManager[key.toId()] = address(0);
+            }
+            _modifyOptionsPositionForUser(key, -positions[key.toId()][user].toInt256(), user);
+        }
+    }
 }
