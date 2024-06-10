@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.25;
 
+// TODO: Remove
 import {console2} from "forge-std/console2.sol";
 
+import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {BaseHook} from "v4-periphery/BaseHook.sol";
+import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {CurrencySettleTake} from "v4-core/libraries/CurrencySettleTake.sol"; // TODO: Use test/utils/CurrencySettler.sol instead?
-import {BaseHook} from "v4-periphery/BaseHook.sol";
-import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
-import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
-import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 /**
@@ -45,6 +46,7 @@ contract AuctionManagedOptionsHook is BaseHook {
 
     error AddLiquidityNotAllowed();
     error CannotWithdrawMoreThanDeposited();
+    error InvalidTickRange();
     error NotDynamicFee();
     error NotEnoughDeposit();
     error NotLiquidatable();
@@ -170,6 +172,10 @@ contract AuctionManagedOptionsHook is BaseHook {
         // Parse hook data to get the tick range. This is a fixed range that every LP deposit must use.
         InitializeParams memory params = abi.decode(hookData, (InitializeParams));
 
+        // Check tick range is valid
+        if (params.tickLower >= params.tickUpper) revert InvalidTickRange();
+        if (params.tickLower % key.tickSpacing != 0 || params.tickUpper % key.tickSpacing != 0) revert InvalidTickRange();
+
         // Initialize pool state
         pools[key.toId()] = PoolState({
             tickLower: params.tickLower,
@@ -266,8 +272,12 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @param amount The amount of ETH to withdraw
     function withdraw(PoolKey calldata key, uint256 amount) external {
         PoolId poolId = key.toId();
-        PoolState storage pool = pools[poolId];
-        if (msg.sender == pool.manager && balances[poolId][msg.sender] - amount < pool.rent * MIN_DEPOSIT_PERIOD) {
+
+        // Get user's up-to-date balance
+        uint256 balance = _pokeUserBalance(key, msg.sender);
+
+        // Check user has enough balance to withdraw
+        if (balances[poolId][msg.sender] - amount < balance) {
             revert NotEnoughDeposit();
         }
 
@@ -303,21 +313,24 @@ contract AuctionManagedOptionsHook is BaseHook {
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
         balance = balances[poolId][user];
-        uint256 lastPaymentBlock_ = lastPaymentBlock[poolId][user];
 
-        // Subtract rent payments if user is the manager
+        // Calculate rent payments if user is the manager
+        uint256 paymentPerBlock = 0;
         if (user == pool.manager) {
-            uint256 timeSinceLastCharge = block.number - lastPaymentBlock_;
-            uint256 rentOwed = pool.rent * timeSinceLastCharge;
-            if (rentOwed > balance) rentOwed = balance;
-            balance -= rentOwed;
+            paymentPerBlock = pool.rent;
         }
 
-        // Subtract funding payments if user has an open options position
+        // Calculate funding payments if user has an open options position
         if (positions[poolId][user] > 0) {
-            uint256 funding = calcCumulativeFunding(key) - lastPaymentBlock_;
-            balance -= funding * positions[poolId][user];
+            uint256 fundingSinceLastCharge = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
+            paymentPerBlock += fundingSinceLastCharge * positions[poolId][user];
         }
+
+        // Subtract payments from balance
+        uint256 blocksSinceLastPayment = block.number - lastPaymentBlock[poolId][user];
+        uint256 payment = paymentPerBlock * blocksSinceLastPayment;
+        if (payment > balance) payment = balance;
+        balance -= payment;
     }
 
     /// @notice Modify liquidity in a pool. This method should be used instead of the default modifyLiquidity
