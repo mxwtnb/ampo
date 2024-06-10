@@ -57,31 +57,14 @@ contract AuctionManagedOptionsHook is BaseHook {
 
     /// @notice State stored for each pool
     struct PoolState {
-        // Fixed range for the pool. All LP deposits must use this range.
         int24 tickLower;
         int24 tickUpper;
-        /// @notice Store notional value of option. This is the amount of token0 that user
-        /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
-        /// and token0 is ETH, then the notional value of 1 option would just be 1 ETH.
-        /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
-        /// value is calculated by seeing how much the LP position that was withdrawn would be
-        /// worth if it's completely in terms of token0.
         uint256 notionalPerLiquidity;
-        /// The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
-        /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
         address manager;
-        // The rent, i.e. the amount of ETH that the manager pays to LPs per block
         uint256 rent;
-        // Block at which rent was last charged. Used to keep track of how much rent the manager owes.
-        // TODO: Fix to be per user
-        uint256 lastRentPaidBlock;
-        // Current funding rate of the pool. This is the amount option holders pay per block to the manager.
         uint256 fundingRate;
-        // Cumulative funding of the pool. This is the sum of `fundingRate` across all blocks.
         uint256 cumulativeFunding;
-        // Block at which `cumulativeFunding` was last updated
-        // TODO: Split. update cum funding and charge funding are two separate things.
-        uint256 lastFundingPaidBlock;
+        uint256 lastCumulativeFundingUpdateBlock;
     }
 
     /// @notice Data passed to `PoolManager.unlock` when modifying liquidity
@@ -122,7 +105,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     // mapping(PoolId => uint256) public rent;
 
     /// @notice Block at which rent was last charged. Used to keep track of how much rent the manager owes.
-    // mapping(PoolId => uint256) public lastRentPaidBlock;
+    // mapping(PoolId => mapping(address => uint256)) public lastRentPaidBlock;
 
     /// @notice Current funding rate of the pool. This is the amount option holders pay per block to the manager.
     /// It can be changed at any time by the manager.
@@ -132,11 +115,13 @@ contract AuctionManagedOptionsHook is BaseHook {
     // mapping(PoolId => uint256) public cumulativeFunding;
 
     /// @notice Block at which `cumulativeFunding` was last updated
-    // mapping(PoolId => uint256) public lastFundingPaidBlock;
+    // mapping(PoolId => mapping(address => uint256)) public lastFundingPaidBlock;
 
     /// @notice Cumulative funding at the last time the user was charged. Used to keep track of
     /// how much funding the user owes to the manager.
     mapping(PoolId => mapping(address => uint256)) public cumulativeFundingAtLastCharge;
+
+    mapping(PoolId => mapping(address => uint256)) public lastPaymentBlock;
 
     // TODO: Rename to balanceOf?
     // TODO: Add events on transfer/mint etc
@@ -192,10 +177,9 @@ contract AuctionManagedOptionsHook is BaseHook {
             notionalPerLiquidity: 0,
             manager: address(0),
             rent: 0,
-            lastRentPaidBlock: 0,
             fundingRate: 0,
             cumulativeFunding: 0,
-            lastFundingPaidBlock: 0
+            lastCumulativeFundingUpdateBlock: 0
         });
 
         // Precalculate the notional value per liquidity. This is used later on when
@@ -266,7 +250,6 @@ contract AuctionManagedOptionsHook is BaseHook {
 
             pool.manager = msg.sender;
             pool.rent = rent;
-            pool.lastRentPaidBlock = block.number;
         }
     }
 
@@ -300,10 +283,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         balances[poolId][user] = balance;
 
         // Update blocks on which user was last charged rent and funding
-        if (user == pool.manager) {
-            pool.lastRentPaidBlock = block.number;
-        }
-        pool.lastFundingPaidBlock = block.number;
+        lastPaymentBlock[poolId][user] = block.number;
 
         // If user is the manager and they has no collateral left, kick them out
         if (user == pool.manager && balances[poolId][user] == 0) {
@@ -323,10 +303,11 @@ contract AuctionManagedOptionsHook is BaseHook {
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
         balance = balances[poolId][user];
+        uint256 lastPaymentBlock_ = lastPaymentBlock[poolId][user];
 
         // Subtract rent payments if user is the manager
         if (user == pool.manager) {
-            uint256 timeSinceLastCharge = block.number - pool.lastRentPaidBlock;
+            uint256 timeSinceLastCharge = block.number - lastPaymentBlock_;
             uint256 rentOwed = pool.rent * timeSinceLastCharge;
             if (rentOwed > balance) rentOwed = balance;
             balance -= rentOwed;
@@ -334,7 +315,7 @@ contract AuctionManagedOptionsHook is BaseHook {
 
         // Subtract funding payments if user has an open options position
         if (positions[poolId][user] > 0) {
-            uint256 funding = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
+            uint256 funding = calcCumulativeFunding(key) - lastPaymentBlock_;
             balance -= funding * positions[poolId][user];
         }
     }
@@ -400,7 +381,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         if (msg.sender != pool.manager) revert OnlyManager();
 
         pool.cumulativeFunding = calcCumulativeFunding(key);
-        pool.lastFundingPaidBlock = block.number;
+        pool.lastCumulativeFundingUpdateBlock = block.number;
 
         // TODO: Override if utilization ratio too high
         pool.fundingRate = fundingRate;
@@ -413,7 +394,8 @@ contract AuctionManagedOptionsHook is BaseHook {
     function calcCumulativeFunding(PoolKey calldata key) public view returns (uint256) {
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
-        return pool.cumulativeFunding + (block.number - pool.lastFundingPaidBlock) * pool.fundingRate;
+        uint256 blocksSinceLastUpdate = block.number - pool.lastCumulativeFundingUpdateBlock;
+        return pool.cumulativeFunding + blocksSinceLastUpdate * pool.fundingRate;
     }
 
     /// @notice Called by a user to modify their options position in a pool
