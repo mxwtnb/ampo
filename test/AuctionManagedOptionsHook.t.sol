@@ -23,11 +23,15 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
 
-    AuctionManagedOptionsHook public hook;
+    address MANAGER = address(0x1000);
 
     int24 TICK_SPACING = 60;
+
+    // Default initialization parameters with tick range of -60 to 60 and 1% fee
     bytes constant INIT_PARAMS =
-        abi.encode(AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60, payInTokenZero: true}));
+        abi.encode(AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
+
+    AuctionManagedOptionsHook public hook;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -69,22 +73,22 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         PoolKey memory key2 = PoolKey(currency0, currency1, 20_000 | LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, hook);
 
         // Should fail because not multiple of `tickSpacing`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -61, tickUpper: 60, payInTokenZero: true});
+        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -61, tickUpper: 60, lpFee: 10_000, payInTokenZero: true});
         vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because not multiple of `tickSpacing`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: -33, payInTokenZero: true});
+        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: -33, lpFee: 10_000, payInTokenZero: true});
         vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because `tickLower` is not less than `tickUpper`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -180, payInTokenZero: true});
+        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -180, lpFee: 10_000, payInTokenZero: true});
         vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because `tickLower` is not less than `tickUpper`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -240, payInTokenZero: true});
+        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -240, lpFee: 10_000, payInTokenZero: true});
         vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
     }
@@ -92,19 +96,22 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
     function test_beforeInitialize_setsPoolState() public {
         int24 tickLower;
         int24 tickUpper;
+        uint24 lpFee;
         bool payInTokenZero;
-        (tickLower, tickUpper, payInTokenZero,,,,,,) = hook.pools(key.toId());
+        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,) = hook.pools(key.toId());
         assertEq(tickLower, -60);
         assertEq(tickUpper, 60);
+        assertEq(lpFee, 10_000);
         assertTrue(payInTokenZero);
 
         PoolKey memory key2 = PoolKey(currency0, currency1, 20_000 | LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, hook);
         AuctionManagedOptionsHook.InitializeParams memory params =
-            AuctionManagedOptionsHook.InitializeParams({tickLower: -120, tickUpper: 180, payInTokenZero: false});
+            AuctionManagedOptionsHook.InitializeParams({tickLower: -120, tickUpper: 180, lpFee: 10_000, payInTokenZero: false});
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
-        (tickLower, tickUpper, payInTokenZero,,,,,,) = hook.pools(key2.toId());
+        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,) = hook.pools(key2.toId());
         assertEq(tickLower, -120);
         assertEq(tickUpper, 180);
+        assertEq(lpFee, 10_000);
         assertFalse(payInTokenZero);
     }
 
@@ -119,56 +126,49 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
     }
 
     function test_beforeSwap_feesChargedWhenNoManager() public {
+        // Swap 0.001 token0 -> token1
+        BalanceDelta delta = _swap(true, 0.001 ether);
+
+        // Check loss is around 1%. Initial price was set to 1 and price impact should be small so
+        // loss should be similar to the default fee of 1%.
+        int128 loss = 1e18 + delta.amount1() * 1e18 / delta.amount0();
+        assertGt(loss, 0.0099e18);
+        assertLt(loss, 0.0101e18);
+    }
+
+    // function test_beforeSwap_feesChargedAndGoToManager() public {
+    //     // Manager bids and becomes manager
+    //     vm.startPrank(MANAGER);
+    //     hook.deposit(key, 100 ether);
+    //     hook.bid(key, 0.000_001 ether);
+    //     vm.stopPrank();
+
+    //     // Swap 0.001 token0 -> token1
+    //     BalanceDelta delta = _swap(true, 0.001 ether);
+    // }
+
+    function _swap(bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta delta) {
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        // Add more liquidity to the pool
-        hook.modifyLiquidity(key, 100 ether);
-
-        // Swap 0.001 token0 -> token1
-        BalanceDelta delta = swapRouter.swap(
+        // Do not use slippage limit
+        uint160 sqrtPriceLimitX96 = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        delta = swapRouter.swap(
             key,
             IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -0.001 ether,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                zeroForOne: zeroForOne,
+                amountSpecified: amountSpecified,
+                sqrtPriceLimitX96: sqrtPriceLimitX96
             }),
             settings,
             ZERO_BYTES
         );
-
-        // Check loss is around 30 bps. Initial price was set to 1 and price impact should be small so
-        // loss should be similar to the default fee of 30 bps.
-        int128 loss = 1e18 + delta.amount1() * 1e18 / delta.amount0();
-        assertGt(loss, 0.0029e18);
-        assertLt(loss, 0.0031e18);
     }
 
-    // function test_SwapFeeShouldBeZero() public {
-    //     PoolKey memory key_ = PoolKey(currency0, currency1, 100, int24(60), hook);
-    //     vm.expectRevert(AuctionManagedOptionsHook.SwapFeeNotZero.selector);
-    //     manager.initialize(key_, SQRT_PRICE_1_1, ZERO_BYTES);
-    // }
 
-    // function test_Swap() public {
-    //     PoolSwapTest.TestSettings memory settings =
-    //         PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-    //     // Swap exact input 100 Token A
-    //     uint256 balance0 = key.currency0.balanceOfSelf();
-    //     uint256 balance1 = key.currency1.balanceOfSelf();
-    //     swapRouter.swap(
-    //         key,
-    //         IPoolManager.SwapParams({
-    //             zeroForOne: true,
-    //             amountSpecified: -0.001 ether,
-    //             sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-    //         }),
-    //         settings,
-    //         ZERO_BYTES
-    //     );
+
 
     //     console2.log("balance0 change", int256(key.currency0.balanceOfSelf()) - int256(balance0));
     //     console2.log("balance1 change", int256(key.currency1.balanceOfSelf()) - int256(balance1));
-    // }
 }

@@ -58,6 +58,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     struct InitializeParams {
         int24 tickLower;
         int24 tickUpper;
+        uint24 lpFee;
         bool payInTokenZero;
     }
 
@@ -65,6 +66,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     struct PoolState {
         int24 tickLower;
         int24 tickUpper;
+        uint24 lpFee;
         bool payInTokenZero;
         uint256 notionalPerLiquidity; // Used for calculations when minting and burning options
         address manager;
@@ -193,6 +195,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         pools[poolId] = PoolState({
             tickLower: params.tickLower,
             tickUpper: params.tickUpper,
+            lpFee: params.lpFee,
             payInTokenZero: params.payInTokenZero,
             notionalPerLiquidity: 0,
             manager: address(0),
@@ -228,15 +231,16 @@ contract AuctionManagedOptionsHook is BaseHook {
         poolManagerOnly
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        address manager = pools[key.toId()].manager;
+        PoolState storage pool = pools[key.toId()];
+        address manager = pool.manager;
 
         // If no manager is set, just pass fees to LPs like a standard Uniswap pool
         if (manager == address(0)) {
-            return (this.beforeSwap.selector, toBeforeSwapDelta(0, 0), LP_FEE_WHEN_NO_MANAGER);
+            return (this.beforeSwap.selector, toBeforeSwapDelta(0, 0), pool.lpFee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
 
         // Calculate swap fees. The fees don't go to LPs, they instead go to the manager of the pool
-        int256 fees = params.amountSpecified * uint256(key.fee).toInt256() / 1e6;
+        int256 fees = params.amountSpecified * uint256(pool.lpFee).toInt256() / 1e6;
         int256 absFees = fees > 0 ? fees : -fees;
 
         // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
@@ -252,7 +256,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         return (this.beforeSwap.selector, toBeforeSwapDelta(-fees.toInt128(), 0), LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 
-    function modifyBid(PoolKey calldata key, uint256 rent) external {
+    function bid(PoolKey calldata key, uint256 rent) external {
         PoolId poolId = key.toId();
         if (balances[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
             revert NotEnoughDeposit();
