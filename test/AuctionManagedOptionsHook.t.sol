@@ -40,10 +40,11 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         IERC20(Currency.unwrap(currency1)).approve(hookAddress, type(uint256).max);
 
         // Initialize a pool with zero fee
-        key = PoolKey(currency0, currency1, 0, int24(60), hook);
-        AuctionManagedOptionsHook.PoolParams memory poolParams =
-            AuctionManagedOptionsHook.PoolParams({tickLower: -60, tickUpper: 60});
-        manager.initialize(key, SQRT_PRICE_1_1, abi.encode(poolParams));
+        // key = PoolKey(currency0, currency1, 0, int24(60), hook);
+        key = PoolKey(currency0, currency1, 0x800000, int24(60), hook);
+        AuctionManagedOptionsHook.InitializeParams memory params =
+            AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60});
+        manager.initialize(key, SQRT_PRICE_1_1, abi.encode(params));
 
         // Add some liquidity
         // modifyLiquidityRouter.modifyLiquidity(
@@ -54,11 +55,11 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         hook.modifyLiquidity(key, 100 ether);
     }
 
-    function test_SwapFeeShouldBeZero() public {
-        PoolKey memory key_ = PoolKey(currency0, currency1, 100, int24(60), hook);
-        vm.expectRevert(AuctionManagedOptionsHook.SwapFeeNotZero.selector);
-        manager.initialize(key_, SQRT_PRICE_1_1, ZERO_BYTES);
-    }
+    // function test_SwapFeeShouldBeZero() public {
+    //     PoolKey memory key_ = PoolKey(currency0, currency1, 100, int24(60), hook);
+    //     vm.expectRevert(AuctionManagedOptionsHook.SwapFeeNotZero.selector);
+    //     manager.initialize(key_, SQRT_PRICE_1_1, ZERO_BYTES);
+    // }
 
     function test_Swap() public {
         PoolSwapTest.TestSettings memory settings =

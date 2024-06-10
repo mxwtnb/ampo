@@ -14,6 +14,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -36,23 +37,51 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 contract AuctionManagedOptionsHook is BaseHook {
     using CurrencyLibrary for Currency;
     using CurrencySettleTake for Currency;
+    using LPFeeLibrary for uint24;
     using PoolIdLibrary for PoolKey;
     using SafeCast for int256;
     using SafeCast for uint256;
 
     error AddLiquidityNotAllowed();
     error CannotWithdrawMoreThanDeposited();
+    error NotDynamicFee();
     error NotEnoughDeposit();
     error NotLiquidatable();
     error OnlyManager();
-    error SwapFeeNotZero();
 
-    /// @notice When a pool is initialized with this hook, the fixed range must be specified.
-    /// `tickLower` and `tickUpper` are the lower and upper ticks of this range.
-    /// TODO: Rename to Range
-    struct PoolParams {
+    /// @notice Parameters that need to be specified when initializing a pool.
+    struct InitializeParams {
         int24 tickLower;
         int24 tickUpper;
+    }
+
+    /// @notice State stored for each pool
+    struct PoolState {
+        // Fixed range for the pool. All LP deposits must use this range.
+        int24 tickLower;
+        int24 tickUpper;
+        /// @notice Store notional value of option. This is the amount of token0 that user
+        /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
+        /// and token0 is ETH, then the notional value of 1 option would just be 1 ETH.
+        /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
+        /// value is calculated by seeing how much the LP position that was withdrawn would be
+        /// worth if it's completely in terms of token0.
+        uint256 notionalPerLiquidity;
+        /// The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
+        /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
+        address manager;
+        // The rent, i.e. the amount of ETH that the manager pays to LPs per block
+        uint256 rent;
+        // Block at which rent was last charged. Used to keep track of how much rent the manager owes.
+        // TODO: Fix to be per user
+        uint256 lastRentPaidBlock;
+        // Current funding rate of the pool. This is the amount option holders pay per block to the manager.
+        uint256 fundingRate;
+        // Cumulative funding of the pool. This is the sum of `fundingRate` across all blocks.
+        uint256 cumulativeFunding;
+        // Block at which `cumulativeFunding` was last updated
+        // TODO: Split. update cum funding and charge funding are two separate things.
+        uint256 lastFundingPaidBlock;
     }
 
     /// @notice Data passed to `PoolManager.unlock` when modifying liquidity
@@ -71,7 +100,11 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// Period is in blocks.
     uint256 public constant MIN_HEALTHY_PERIOD = 100;
 
-    mapping(PoolId => PoolParams) public poolParams;
+    mapping(PoolId => PoolState) public pools;
+
+    /// @notice When a pool is initialized with this hook, the fixed range must be specified.
+    // mapping(PoolId => int24) public tickLower;
+    // mapping(PoolId => int24) public tickUpper;
 
     /// @notice Store notional value of option. This is the amount of token0 that user
     /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
@@ -79,27 +112,27 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
     /// value is calculated by seeing how much the LP position that was withdrawn would be
     /// worth if it's completely in terms of token0.
-    mapping(PoolId => uint256) public notionalPerLiquidity;
+    // mapping(PoolId => uint256) public notionalPerLiquidity;
 
     /// @notice The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
     /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
-    mapping(PoolId => address) public optionManager;
+    // mapping(PoolId => address) public manager;
 
     /// @notice "Rent" is the amount of ETH that the manager pays to LPs per block
-    mapping(PoolId => uint256) public managerRent;
+    // mapping(PoolId => uint256) public rent;
 
     /// @notice Block at which rent was last charged. Used to keep track of how much rent the manager owes.
-    mapping(PoolId => uint256) public lastRentPaidBlock;
+    // mapping(PoolId => uint256) public lastRentPaidBlock;
 
     /// @notice Current funding rate of the pool. This is the amount option holders pay per block to the manager.
     /// It can be changed at any time by the manager.
-    mapping(PoolId => uint256) public currentFundingRate;
+    // mapping(PoolId => uint256) public fundingRate;
 
-    /// @notice Cumulative funding of the pool. This is the sum of `currentFundingRate` across all blocks.
-    mapping(PoolId => uint256) public cumulativeFunding;
+    /// @notice Cumulative funding of the pool. This is the sum of `fundingRate` across all blocks.
+    // mapping(PoolId => uint256) public cumulativeFunding;
 
     /// @notice Block at which `cumulativeFunding` was last updated
-    mapping(PoolId => uint256) public lastFundingPaidBlock;
+    // mapping(PoolId => uint256) public lastFundingPaidBlock;
 
     /// @notice Cumulative funding at the last time the user was charged. Used to keep track of
     /// how much funding the user owes to the manager.
@@ -148,13 +181,27 @@ contract AuctionManagedOptionsHook is BaseHook {
         override
         returns (bytes4)
     {
-        if (key.fee != 0) revert SwapFeeNotZero();
-        poolParams[key.toId()] = abi.decode(hookData, (PoolParams));
+        // Pool must have dynamic fee flag set.
+        if (!key.fee.isDynamicFee()) revert NotDynamicFee();
 
-        notionalPerLiquidity[key.toId()] = LiquidityAmounts.getAmount0ForLiquidity(
-            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickLower),
-            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickUpper),
-            1e18
+        // Parse hook data to get the tick range. This is a fixed range that every LP deposit must use.
+        InitializeParams memory params = abi.decode(hookData, (InitializeParams));
+        pools[key.toId()] = PoolState({
+            tickLower: params.tickLower,
+            tickUpper: params.tickUpper,
+            notionalPerLiquidity: 0,
+            manager: address(0),
+            rent: 0,
+            lastRentPaidBlock: 0,
+            fundingRate: 0,
+            cumulativeFunding: 0,
+            lastFundingPaidBlock: 0
+        });
+
+        // Precalculate the notional value per liquidity. This is used later on when
+        // users mint or burn options.
+        pools[key.toId()].notionalPerLiquidity = LiquidityAmounts.getAmount0ForLiquidity(
+            TickMath.getSqrtPriceAtTick(params.tickLower), TickMath.getSqrtPriceAtTick(params.tickUpper), 1e18
         );
         return this.beforeInitialize.selector;
     }
@@ -175,17 +222,17 @@ contract AuctionManagedOptionsHook is BaseHook {
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        address manager = optionManager[key.toId()];
+        address manager = pools[key.toId()].manager;
 
         // If no manager is set, just pass fees to LPs like a standard Uniswap pool
         if (manager == address(0)) {
-            return (this.beforeSwap.selector, toBeforeSwapDelta(int128(0), int128(0)), 0);
+            // Override LP fee to zero
+            return (this.beforeSwap.selector, toBeforeSwapDelta(int128(0), int128(0)), LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
 
         // Calculate swap fees. The fees don't go to LPs, they instead go to the manager of the pool
-        // TODO: Fee is currency hardcoded. Use key.fee instead.
-        int128 fees = int128(params.amountSpecified) / 50;
-        int128 absFees = fees > 0 ? fees : -fees;
+        int256 fees = params.amountSpecified * uint256(key.fee).toInt256() / int256(1e6);
+        int256 absFees = fees > 0 ? fees : -fees;
 
         // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
         // so the feeCurrency should be the token the swapper is selling.
@@ -194,8 +241,11 @@ contract AuctionManagedOptionsHook is BaseHook {
         Currency feeCurrency = exactOut != params.zeroForOne ? key.currency0 : key.currency1;
 
         // Send fees to manager
-        feeCurrency.take(poolManager, manager, uint256(int256(absFees)), true);
-        return (this.beforeSwap.selector, toBeforeSwapDelta(-fees, int128(0)), 0);
+        feeCurrency.take(poolManager, manager, absFees.toUint256(), true);
+
+        // Override LP fee to zero
+        return
+            (this.beforeSwap.selector, toBeforeSwapDelta(-fees.toInt128(), int128(0)), LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 
     function modifyBid(PoolKey calldata key, uint256 rent) external {
@@ -204,18 +254,19 @@ contract AuctionManagedOptionsHook is BaseHook {
             revert NotEnoughDeposit();
         }
 
-        if (optionManager[poolId] == msg.sender) {
+        PoolState storage pool = pools[poolId];
+        if (pool.manager == msg.sender) {
             // Modify or cancel bid
-            managerRent[poolId] = rent;
-        } else if (rent > managerRent[poolId]) {
+            pool.rent = rent;
+        } else if (rent > pool.rent) {
             // Submit new highest bid
-            address prevManager = optionManager[poolId];
+            address prevManager = pool.manager;
             _pokeUserBalance(key, prevManager);
             _modifyOptionsPositionForUser(key, -positions[poolId][prevManager].toInt256(), prevManager);
 
-            optionManager[poolId] = msg.sender;
-            managerRent[poolId] = rent;
-            lastRentPaidBlock[poolId] = block.number;
+            pool.manager = msg.sender;
+            pool.rent = rent;
+            pool.lastRentPaidBlock = block.number;
         }
     }
 
@@ -232,10 +283,8 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @param amount The amount of ETH to withdraw
     function withdraw(PoolKey calldata key, uint256 amount) external {
         PoolId poolId = key.toId();
-        if (
-            msg.sender == optionManager[poolId]
-                && balances[poolId][msg.sender] - amount < managerRent[poolId] * MIN_DEPOSIT_PERIOD
-        ) {
+        PoolState storage pool = pools[poolId];
+        if (msg.sender == pool.manager && balances[poolId][msg.sender] - amount < pool.rent * MIN_DEPOSIT_PERIOD) {
             revert NotEnoughDeposit();
         }
 
@@ -246,41 +295,44 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// if they have an open options position.
     function _pokeUserBalance(PoolKey calldata key, address user) internal returns (uint256 balance) {
         PoolId poolId = key.toId();
+        PoolState storage pool = pools[poolId];
         balance = calcBalance(key, user);
         balances[poolId][user] = balance;
 
         // Update blocks on which user was last charged rent and funding
-        if (user == optionManager[poolId]) {
-            lastRentPaidBlock[poolId] = block.number;
+        if (user == pool.manager) {
+            pool.lastRentPaidBlock = block.number;
         }
-        lastFundingPaidBlock[poolId] = block.number;
+        pool.lastFundingPaidBlock = block.number;
+
+        // If user is the manager and they has no collateral left, kick them out
+        if (user == pool.manager && balances[poolId][user] == 0) {
+            pool.manager = address(0);
+        }
     }
 
-    /// @notice Poke manager's balance and kick them out if they have no collateral left.
+    /// @notice Poke manager's balance.
     function _pokeManagerBalance(PoolKey calldata key) internal {
         PoolId poolId = key.toId();
-        address manager = optionManager[poolId];
+        address manager = pools[poolId].manager;
         _pokeUserBalance(key, manager);
-
-        // If manager has no collateral left, kick them out
-        if (manager != address(0) && balances[poolId][manager] == 0) {
-            optionManager[poolId] = address(0);
-        }
     }
 
-    // TODO: add updateBalance() which calls this
-    // TODO: subtract funding payments from balance
+    /// @notice Calculate user's balance in a pool accounting for rent and funding payments
     function calcBalance(PoolKey calldata key, address user) public view returns (uint256 balance) {
         PoolId poolId = key.toId();
+        PoolState storage pool = pools[poolId];
         balance = balances[poolId][user];
 
-        if (user == optionManager[poolId]) {
-            uint256 timeSinceLastCharge = block.number - lastRentPaidBlock[poolId];
-            uint256 rentOwed = managerRent[poolId] * timeSinceLastCharge;
+        // Subtract rent payments if user is the manager
+        if (user == pool.manager) {
+            uint256 timeSinceLastCharge = block.number - pool.lastRentPaidBlock;
+            uint256 rentOwed = pool.rent * timeSinceLastCharge;
             if (rentOwed > balance) rentOwed = balance;
             balance -= rentOwed;
         }
 
+        // Subtract funding payments if user has an open options position
         if (positions[poolId][user] > 0) {
             uint256 funding = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
             balance -= funding * positions[poolId][user];
@@ -296,10 +348,12 @@ contract AuctionManagedOptionsHook is BaseHook {
         delta =
             abi.decode(poolManager.unlock(abi.encode(CallbackData(key, msg.sender, liquidityDelta, 0))), (BalanceDelta));
 
+        // Calculate new position. Ensure it's positive, i.e. the user is not withdrawing more than they deposited
         int256 position = int256(positions[key.toId()][msg.sender]) + liquidityDelta;
         if (position < 0) revert CannotWithdrawMoreThanDeposited();
         positions[key.toId()][msg.sender] = uint256(position);
 
+        // Sweep any native eth balance to the user
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
             CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
@@ -311,19 +365,24 @@ contract AuctionManagedOptionsHook is BaseHook {
         require(msg.sender == address(poolManager));
         CallbackData memory data = abi.decode(rawData, (CallbackData));
         PoolId poolId = data.key.toId();
+        PoolState storage pool = pools[poolId];
 
-        PoolParams memory pp = poolParams[poolId];
+        // Create params for `PoolManager.modifyLiquidity`
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager.ModifyLiquidityParams({
-            tickLower: pp.tickLower,
-            tickUpper: pp.tickUpper,
+            tickLower: pool.tickLower,
+            tickUpper: pool.tickUpper,
             liquidityDelta: data.liquidityDelta,
             salt: ""
         });
 
+        // Calculate deltas of each token. `data.delta0` allows us to make additional
+        // token0 transfers in the callback. This is needed for transferring the notional value
+        // when users mint or burn options.
         (BalanceDelta delta,) = poolManager.modifyLiquidity(data.key, params, "");
         int256 delta0 = delta.amount0() + data.delta0;
         int256 delta1 = delta.amount1();
 
+        // Settle and take tokens
         if (delta0 < 0) data.key.currency0.settle(poolManager, data.sender, uint256(-delta0), false);
         if (delta1 < 0) data.key.currency1.settle(poolManager, data.sender, uint256(-delta1), false);
         if (delta0 > 0) data.key.currency0.take(poolManager, data.sender, uint256(delta0), false);
@@ -336,19 +395,25 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @param fundingRate The new funding rate
     /// TODO: Add sanity checks on funding
     function setFunding(PoolKey calldata key, uint256 fundingRate) external {
-        if (msg.sender != optionManager[key.toId()]) revert OnlyManager();
-
         PoolId poolId = key.toId();
-        cumulativeFunding[poolId] = calcCumulativeFunding(key);
-        lastFundingPaidBlock[poolId] = block.number;
+        PoolState storage pool = pools[poolId];
+        if (msg.sender != pool.manager) revert OnlyManager();
+
+        pool.cumulativeFunding = calcCumulativeFunding(key);
+        pool.lastFundingPaidBlock = block.number;
 
         // TODO: Override if utilization ratio too high
-        currentFundingRate[poolId] = fundingRate;
+        pool.fundingRate = fundingRate;
     }
 
+    /// @notice Calculate the cumulative funding of a pool. This is the sum of the funding rate
+    /// across all blocks in the past. For example, if the current funding rate is 0.0001, after 100 blocks the
+    /// cumulative funding would increase by 0.01.
+    /// @param key The pool to calculate cumulative funding for
     function calcCumulativeFunding(PoolKey calldata key) public view returns (uint256) {
         PoolId poolId = key.toId();
-        return cumulativeFunding[poolId] + (block.number - lastFundingPaidBlock[poolId]) * currentFundingRate[poolId];
+        PoolState storage pool = pools[poolId];
+        return pool.cumulativeFunding + (block.number - pool.lastFundingPaidBlock) * pool.fundingRate;
     }
 
     /// @notice Called by a user to modify their options position in a pool
@@ -366,13 +431,19 @@ contract AuctionManagedOptionsHook is BaseHook {
     {
         _pokeUserBalance(key, user);
         int256 absPositionDelta = positionDelta > 0 ? positionDelta : -positionDelta;
-        uint256 notional = absPositionDelta.toUint256() * notionalPerLiquidity[key.toId()] / 1e18;
+        uint256 notional = absPositionDelta.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
 
         // Modify liquidity owned by the hook, equivalent to minting or burning options
         delta = abi.decode(
             poolManager.unlock(abi.encode(CallbackData(key, user, -positionDelta.toInt128(), -notional.toInt256()))),
             (BalanceDelta)
         );
+
+        // Sweep any native eth balance to the user
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            CurrencyLibrary.NATIVE.transfer(user, ethBalance);
+        }
     }
 
     /// @notice Liquidate a user if their balance can't cover payments for a certain period.
@@ -381,19 +452,22 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @param key Pool for which user's balance is liquidated
     /// @param user User to liquidate
     function liquidate(PoolKey calldata key, address user) external {
+        PoolId poolId = key.toId();
+        PoolState storage pool = pools[poolId];
+
         // Get updated balance
         uint256 balance = _pokeUserBalance(key, user);
 
         // Calculate how much the user pays each block
         uint256 paymentPerBlock = 0;
-        bool isManager = user == optionManager[key.toId()];
+        bool isManager = user == pool.manager;
         if (isManager) {
             // Rent payment if the user is the manager of the pool
-            paymentPerBlock += managerRent[key.toId()];
+            paymentPerBlock += pool.rent;
         }
         if (positions[key.toId()][user] > 0) {
             // Funding payment if user has options position open
-            paymentPerBlock += currentFundingRate[key.toId()];
+            paymentPerBlock += pool.fundingRate;
         }
 
         // Check the user can be liquidated, i.e. their balance is insufficient to cover payments
@@ -404,7 +478,7 @@ contract AuctionManagedOptionsHook is BaseHook {
 
         // If the user is the manager, kick them out
         if (isManager) {
-            optionManager[key.toId()] = address(0);
+            pool.manager = address(0);
         }
 
         // Force close their positions
