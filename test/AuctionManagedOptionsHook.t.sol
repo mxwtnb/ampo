@@ -43,7 +43,7 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         // key = PoolKey(currency0, currency1, 0, int24(60), hook);
         key = PoolKey(currency0, currency1, 0x800000, int24(60), hook);
         AuctionManagedOptionsHook.InitializeParams memory params =
-            AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60});
+            AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60, payInTokenZero: true});
         manager.initialize(key, SQRT_PRICE_1_1, abi.encode(params));
 
         // Add some liquidity
