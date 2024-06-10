@@ -14,6 +14,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
@@ -21,12 +22,12 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
  * @title   AuctionManagedOptionsHook
  * @author  mxwtnb
  * @notice  A Uniswap V4 hook that lets users trade perpetual options.
- * 
+ *
  *          Perpetual options are options that never expire and can be exercise at any point in the future.
  *          They can be synthetically constructed by borrowing a narrow Uniswap concentrated liquidity
  *          position, withdrawing it and swapping for one of the tokens if needed. Users with an open
  *          perpetual options position have to pay funding each block, similar to funding on perpetual futures.
- * 
+ *
  *          The pricing of these options is auction-managed. A continuous auction is run
  *          where anyone can bid for the right to change the funding rate and to receive funding from
  *          open options positions. They are therefore incentivized to set it in a way that maximizes
@@ -36,8 +37,11 @@ contract AuctionManagedOptionsHook is BaseHook {
     using CurrencyLibrary for Currency;
     using CurrencySettleTake for Currency;
     using PoolIdLibrary for PoolKey;
+    using SafeCast for int256;
+    using SafeCast for uint256;
 
     error AddLiquidityNotAllowed();
+    error CannotWithdrawMoreThanDeposited();
     error NotEnoughDeposit();
     error OnlyManager();
     error SwapFeeNotZero();
@@ -62,6 +66,14 @@ contract AuctionManagedOptionsHook is BaseHook {
     uint256 public constant MIN_DEPOSIT_PERIOD = 300;
 
     mapping(PoolId => PoolParams) public poolParams;
+
+    /// @notice Store notional value of option. This is the amount of token0 that user
+    /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
+    /// and token0 is ETH, then the notional value of 1 option would just be 1 ETH.
+    /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
+    /// value is calculated by seeing how much the LP position that was withdrawn would be
+    /// worth if it's completely in terms of token0.
+    mapping(PoolId => uint256) public notionalPerLiquidity;
 
     /// @notice The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
     /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
@@ -90,7 +102,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     // TODO: Rename to balanceOf?
     // TODO: Add events on transfer/mint etc
     mapping(PoolId => mapping(address => uint256)) public balances;
-    mapping(PoolId => mapping(address => int256)) public positions;
+    mapping(PoolId => mapping(address => uint256)) public positions;
 
     /**
      * Constructor
@@ -132,6 +144,12 @@ contract AuctionManagedOptionsHook is BaseHook {
     {
         if (key.fee != 0) revert SwapFeeNotZero();
         poolParams[key.toId()] = abi.decode(hookData, (PoolParams));
+
+        notionalPerLiquidity[key.toId()] = LiquidityAmounts.getAmount0ForLiquidity(
+            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickLower),
+            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickUpper),
+            1e18
+        );
         return this.beforeInitialize.selector;
     }
 
@@ -185,7 +203,8 @@ contract AuctionManagedOptionsHook is BaseHook {
             managerRent[poolId] = rent;
         } else if (rent > managerRent[poolId]) {
             // Submit new highest bid
-            // TODO: Make sure old manager is charged rent up to now
+            _chargeRent(key);
+            _modifyOptionsPositionForUser(key, -positions[poolId][msg.sender].toInt256(), msg.sender);
             optionManager[poolId] = msg.sender;
             managerRent[poolId] = rent;
             lastRentBlock[poolId] = block.number;
@@ -262,8 +281,9 @@ contract AuctionManagedOptionsHook is BaseHook {
         delta =
             abi.decode(poolManager.unlock(abi.encode(CallbackData(key, msg.sender, liquidityDelta, 0))), (BalanceDelta));
 
-        // Make sure not negative
-        positions[key.toId()][msg.sender] = positions[key.toId()][msg.sender] + liquidityDelta;
+        int256 position = int256(positions[key.toId()][msg.sender]) + liquidityDelta;
+        if (position < 0) revert CannotWithdrawMoreThanDeposited();
+        positions[key.toId()][msg.sender] = uint256(position);
 
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
@@ -322,43 +342,25 @@ contract AuctionManagedOptionsHook is BaseHook {
     function _chargeFunding(PoolKey calldata key, address user) internal {
         PoolId poolId = key.toId();
         uint256 funding = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
-        uint256 fee = funding * uint256(positions[poolId][user]);
+        uint256 fee = funding * positions[poolId][user];
         balances[poolId][user] -= fee;
         cumulativeFundingAtLastCharge[poolId][user] = calcCumulativeFunding(key);
     }
 
-    function mintCallOption(PoolKey calldata key, uint128 amount) external returns (BalanceDelta delta) {
-        _chargeFunding(key, msg.sender);
-        uint256 notional = _calcNotional(key, amount);
-        delta = abi.decode(
-            poolManager.unlock(abi.encode(CallbackData(key, address(this), -int128(amount), -int256(notional)))),
-            (BalanceDelta)
-        );
+    function modifyOptionsPosition(PoolKey calldata key, int256 positionDelta) external returns (BalanceDelta delta) {
+        delta = _modifyOptionsPositionForUser(key, positionDelta, msg.sender);
     }
 
-    function burnCallOption(PoolKey calldata key, uint128 amount) external returns (BalanceDelta delta) {
-        _chargeFunding(key, msg.sender);
-        uint256 notional = _calcNotional(key, amount);
+    function _modifyOptionsPositionForUser(PoolKey calldata key, int256 positionDelta, address user)
+        internal
+        returns (BalanceDelta delta)
+    {
+        _chargeFunding(key, user);
+        int256 absPositionDelta = positionDelta > 0 ? positionDelta : -positionDelta;
+        uint256 notional = absPositionDelta.toUint256() * notionalPerLiquidity[key.toId()] / 1e18;
         delta = abi.decode(
-            poolManager.unlock(abi.encode(CallbackData(key, address(this), int128(amount), int256(notional)))),
+            poolManager.unlock(abi.encode(CallbackData(key, user, -positionDelta.toInt128(), -notional.toInt256()))),
             (BalanceDelta)
-        );
-    }
-
-    /// @notice Calculate notional value of option. This is the amount of token0 that user
-    /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
-    /// and token0 is ETH, then the notional value of 1 option would just be 1 ETH.
-    /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
-    /// value is calculated by seeing how much the LP position that was withdrawn would be
-    /// worth if it's completely in terms of token0.
-    /// @param key The pool to calculate notional value for
-    /// @param amount The amount of options
-    /// @return The notional value of the options
-    function _calcNotional(PoolKey calldata key, uint128 amount) internal view returns (uint256) {
-        return LiquidityAmounts.getAmount0ForLiquidity(
-            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickLower),
-            TickMath.getSqrtPriceAtTick(poolParams[key.toId()].tickUpper),
-            amount
         );
     }
 
