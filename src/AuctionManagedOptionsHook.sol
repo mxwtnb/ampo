@@ -44,7 +44,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     using SafeCast for int256;
     using SafeCast for uint256;
 
-    error AddLiquidityNotAllowed();
+    error ModifyLiquidityViaHookOnly();
     error CannotWithdrawMoreThanDeposited();
     error InvalidTickRange();
     error NotDynamicFee();
@@ -90,6 +90,9 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @notice If a user's balance can't cover payments for this period, they can be liquidated.
     /// Period is in blocks.
     uint256 public constant MIN_HEALTHY_PERIOD = 100;
+
+    /// @notice Use LP fee of 30 bps when there's no manager.
+    uint24 public constant LP_FEE_WHEN_NO_MANAGER = 3_000 | LPFeeLibrary.OVERRIDE_FEE_FLAG;
 
     mapping(PoolId => PoolState) public pools;
 
@@ -173,7 +176,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         poolManagerOnly
         returns (bytes4)
     {
-        // Pool must have dynamic fee flag set.
+        // Pool must have dynamic fee flag set. This is so we can override the LP fee in `beforeSwap`.
         if (!key.fee.isDynamicFee()) revert NotDynamicFee();
 
         // Parse hook data to get the tick range. This is a fixed range that every LP deposit must use.
@@ -207,7 +210,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         return this.beforeInitialize.selector;
     }
 
-    // TODO: change to beforeModifyPosition?
+    /// @notice Revert if user tries to add liquidity without doing it via this hook's `modifyLiquidity` method.
     function beforeAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
         external
         view
@@ -215,8 +218,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         poolManagerOnly
         returns (bytes4)
     {
-        revert AddLiquidityNotAllowed();
-        // return this.beforeAddLiquidity.selector;
+        revert ModifyLiquidityViaHookOnly();
     }
 
     /// @notice Redirect swap fees to the manager of the pool.
@@ -230,12 +232,11 @@ contract AuctionManagedOptionsHook is BaseHook {
 
         // If no manager is set, just pass fees to LPs like a standard Uniswap pool
         if (manager == address(0)) {
-            // Override LP fee to zero
-            return (this.beforeSwap.selector, toBeforeSwapDelta(0, 0), LPFeeLibrary.OVERRIDE_FEE_FLAG);
+            return (this.beforeSwap.selector, toBeforeSwapDelta(0, 0), LP_FEE_WHEN_NO_MANAGER);
         }
 
         // Calculate swap fees. The fees don't go to LPs, they instead go to the manager of the pool
-        int256 fees = params.amountSpecified * uint256(key.fee).toInt256() / int256(1e6);
+        int256 fees = params.amountSpecified * uint256(key.fee).toInt256() / 1e6;
         int256 absFees = fees > 0 ? fees : -fees;
 
         // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
@@ -495,7 +496,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         int256 absPositionDelta0 = positionDelta0 > 0 ? positionDelta0 : -positionDelta0;
         int256 absPositionDelta1 = positionDelta1 > 0 ? positionDelta1 : -positionDelta1;
         uint256 notional0 = absPositionDelta0.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
-        uint256 notional1 = absPositionDelta0.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
+        uint256 notional1 = absPositionDelta1.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
 
         // Modify liquidity owned by the hook, equivalent to minting or burning options
         delta = abi.decode(
