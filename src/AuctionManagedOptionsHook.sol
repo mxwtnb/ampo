@@ -450,7 +450,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @param key The pool to set the funding rate in
     /// @param fundingRate The new funding rate
     /// TODO: Add sanity checks on funding
-    function setFunding(PoolKey calldata key, uint256 fundingRate) external {
+    function setFundingRate(PoolKey calldata key, uint256 fundingRate) external {
         PoolState storage pool = pools[key.toId()];
 
         // Only manager can set funding
