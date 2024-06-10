@@ -43,6 +43,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     error AddLiquidityNotAllowed();
     error CannotWithdrawMoreThanDeposited();
     error NotEnoughDeposit();
+    error NotLiquidatable();
     error OnlyManager();
     error SwapFeeNotZero();
 
@@ -62,8 +63,12 @@ contract AuctionManagedOptionsHook is BaseHook {
         int256 delta0; // Allows additional token0 to be settled or taken
     }
 
-    /// @notice Period for which manager deposit needs to cover rent
+    /// @notice When manager bids, they must deposit enough to cover the rent for this period.
+    /// Period is in blocks.
     uint256 public constant MIN_DEPOSIT_PERIOD = 300;
+
+    /// @notice If a user's balance can't cover payments for this period, they can be liquidated.
+    /// Period is in blocks.
     uint256 public constant MIN_HEALTHY_PERIOD = 100;
 
     mapping(PoolId => PoolParams) public poolParams;
@@ -84,7 +89,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     mapping(PoolId => uint256) public managerRent;
 
     /// @notice Block at which rent was last charged. Used to keep track of how much rent the manager owes.
-    mapping(PoolId => uint256) public lastRentBlock;
+    mapping(PoolId => uint256) public lastRentPaidBlock;
 
     /// @notice Current funding rate of the pool. This is the amount option holders pay per block to the manager.
     /// It can be changed at any time by the manager.
@@ -94,7 +99,7 @@ contract AuctionManagedOptionsHook is BaseHook {
     mapping(PoolId => uint256) public cumulativeFunding;
 
     /// @notice Block at which `cumulativeFunding` was last updated
-    mapping(PoolId => uint256) public lastCumulativeFundingBlock;
+    mapping(PoolId => uint256) public lastFundingPaidBlock;
 
     /// @notice Cumulative funding at the last time the user was charged. Used to keep track of
     /// how much funding the user owes to the manager.
@@ -210,7 +215,7 @@ contract AuctionManagedOptionsHook is BaseHook {
 
             optionManager[poolId] = msg.sender;
             managerRent[poolId] = rent;
-            lastRentBlock[poolId] = block.number;
+            lastRentPaidBlock[poolId] = block.number;
         }
     }
 
@@ -237,40 +242,27 @@ contract AuctionManagedOptionsHook is BaseHook {
         balances[poolId][msg.sender] -= amount;
     }
 
-    /// @notice Charge rent to the current manager of the given pool
-    // TODO: add tests for this method
-    function _chargeRent(PoolKey calldata key) internal {
-        PoolId poolId = key.toId();
-
-        // Skip if no manager
-        address manager = optionManager[poolId];
-        if (manager == address(0)) {
-            return;
-        }
-
-        uint256 timeSinceLastCharge = block.number - lastRentBlock[poolId];
-        uint256 rentOwed = managerRent[poolId] * timeSinceLastCharge;
-
-        // Manager is out of collateral so kick them out
-        if (balances[poolId][manager] < rentOwed) {
-            rentOwed = balances[poolId][manager];
-            optionManager[poolId] = address(0);
-        }
-
-        lastRentBlock[poolId] = block.number;
-        balances[poolId][manager] -= rentOwed;
-    }
-
+    /// @notice Update user's balance by charging them rent if they are the manager and funding
+    /// if they have an open options position.
     function _pokeUserBalance(PoolKey calldata key, address user) internal returns (uint256 balance) {
         PoolId poolId = key.toId();
         balance = calcBalance(key, user);
         balances[poolId][user] = balance;
+
+        // Update blocks on which user was last charged rent and funding
+        if (user == optionManager[poolId]) {
+            lastRentPaidBlock[poolId] = block.number;
+        }
+        lastFundingPaidBlock[poolId] = block.number;
     }
 
+    /// @notice Poke manager's balance and kick them out if they have no collateral left.
     function _pokeManagerBalance(PoolKey calldata key) internal {
         PoolId poolId = key.toId();
         address manager = optionManager[poolId];
         _pokeUserBalance(key, manager);
+
+        // If manager has no collateral left, kick them out
         if (manager != address(0) && balances[poolId][manager] == 0) {
             optionManager[poolId] = address(0);
         }
@@ -283,7 +275,7 @@ contract AuctionManagedOptionsHook is BaseHook {
         balance = balances[poolId][user];
 
         if (user == optionManager[poolId]) {
-            uint256 timeSinceLastCharge = block.number - lastRentBlock[poolId];
+            uint256 timeSinceLastCharge = block.number - lastRentPaidBlock[poolId];
             uint256 rentOwed = managerRent[poolId] * timeSinceLastCharge;
             if (rentOwed > balance) rentOwed = balance;
             balance -= rentOwed;
@@ -342,15 +334,13 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// @notice Called by the manager of a pool to set the options funding rate
     /// @param key The pool to set the funding rate in
     /// @param fundingRate The new funding rate
+    /// TODO: Add sanity checks on funding
     function setFunding(PoolKey calldata key, uint256 fundingRate) external {
         if (msg.sender != optionManager[key.toId()]) revert OnlyManager();
-        _updateFunding(key, fundingRate);
-    }
 
-    function _updateFunding(PoolKey calldata key, uint256 fundingRate) internal {
         PoolId poolId = key.toId();
         cumulativeFunding[poolId] = calcCumulativeFunding(key);
-        lastCumulativeFundingBlock[poolId] = block.number;
+        lastFundingPaidBlock[poolId] = block.number;
 
         // TODO: Override if utilization ratio too high
         currentFundingRate[poolId] = fundingRate;
@@ -358,52 +348,71 @@ contract AuctionManagedOptionsHook is BaseHook {
 
     function calcCumulativeFunding(PoolKey calldata key) public view returns (uint256) {
         PoolId poolId = key.toId();
-        return
-            cumulativeFunding[poolId] + (block.number - lastCumulativeFundingBlock[poolId]) * currentFundingRate[poolId];
+        return cumulativeFunding[poolId] + (block.number - lastFundingPaidBlock[poolId]) * currentFundingRate[poolId];
     }
 
-    function _chargeFunding(PoolKey calldata key, address user) internal {
-        PoolId poolId = key.toId();
-        uint256 funding = calcCumulativeFunding(key) - cumulativeFundingAtLastCharge[poolId][user];
-        uint256 fee = funding * positions[poolId][user];
-        balances[poolId][user] -= fee;
-        cumulativeFundingAtLastCharge[poolId][user] = calcCumulativeFunding(key);
-    }
-
+    /// @notice Called by a user to modify their options position in a pool
+    /// @param key The pool to modify the position in
+    /// @param positionDelta The change in position - positive means buy and negative means sell
+    /// @return delta The change in the user's balance in the two tokens
     function modifyOptionsPosition(PoolKey calldata key, int256 positionDelta) external returns (BalanceDelta delta) {
         delta = _modifyOptionsPositionForUser(key, positionDelta, msg.sender);
     }
 
+    /// @dev Internal method called by `modifyOptionsPosition` and `liquidate` to modify a user's options position
     function _modifyOptionsPositionForUser(PoolKey calldata key, int256 positionDelta, address user)
         internal
         returns (BalanceDelta delta)
     {
-        _chargeFunding(key, user);
+        _pokeUserBalance(key, user);
         int256 absPositionDelta = positionDelta > 0 ? positionDelta : -positionDelta;
         uint256 notional = absPositionDelta.toUint256() * notionalPerLiquidity[key.toId()] / 1e18;
+
+        // Modify liquidity owned by the hook, equivalent to minting or burning options
         delta = abi.decode(
             poolManager.unlock(abi.encode(CallbackData(key, user, -positionDelta.toInt128(), -notional.toInt256()))),
             (BalanceDelta)
         );
     }
 
+    /// @notice Liquidate a user if their balance can't cover payments for a certain period.
+    /// Reverts if the user's balance is healthy enough. Can be called by anyone and rewards them
+    /// if the liquidation is successful.
+    /// @param key Pool for which user's balance is liquidated
+    /// @param user User to liquidate
     function liquidate(PoolKey calldata key, address user) external {
+        // Get updated balance
         uint256 balance = _pokeUserBalance(key, user);
 
+        // Calculate how much the user pays each block
         uint256 paymentPerBlock = 0;
         bool isManager = user == optionManager[key.toId()];
         if (isManager) {
+            // Rent payment if the user is the manager of the pool
             paymentPerBlock += managerRent[key.toId()];
         }
         if (positions[key.toId()][user] > 0) {
+            // Funding payment if user has options position open
             paymentPerBlock += currentFundingRate[key.toId()];
         }
 
-        if (balance < paymentPerBlock * MIN_HEALTHY_PERIOD) {
-            if (isManager) {
-                optionManager[key.toId()] = address(0);
-            }
-            _modifyOptionsPositionForUser(key, -positions[key.toId()][user].toInt256(), user);
+        // Check the user can be liquidated, i.e. their balance is insufficient to cover payments
+        // for `MIN_HEALTHY_PERIOD` blocks
+        if (balance >= paymentPerBlock * MIN_HEALTHY_PERIOD) {
+            revert NotLiquidatable();
         }
+
+        // If the user is the manager, kick them out
+        if (isManager) {
+            optionManager[key.toId()] = address(0);
+        }
+
+        // Force close their positions
+        _modifyOptionsPositionForUser(key, -positions[key.toId()][user].toInt256(), user);
+
+        // The liquidated user's balance is set to zero and their balance is given to the caller
+        // as a reward
+        balances[key.toId()][user] = 0;
+        balances[key.toId()][msg.sender] += balance;
     }
 }
