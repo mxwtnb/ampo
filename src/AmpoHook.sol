@@ -23,9 +23,11 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 /**
  * @title   AmpoHook
  * @author  mxwtnb
- * @notice  A Uniswap V4 hook that lets users trade perpetual options.
+ * @notice  Auction-managed perpetual options
  *
- *          Perpetual options are options that never expire and can be exercise at any point in the future.
+ *          In short, this is a Uniswap V4 hook that lets users trade perpetual options.
+ *
+ *          Perpetual options are options that never expire and can be exercised at any point in the future.
  *          They can be synthetically constructed by borrowing a narrow Uniswap concentrated liquidity
  *          position, withdrawing it and swapping for one of the tokens. Users with an open
  *          perpetual options position pay funding each block, similar to funding on perpetual futures.
@@ -44,8 +46,8 @@ contract AmpoHook is BaseHook {
     using SafeCast for int256;
     using SafeCast for uint256;
 
-    error ModifyLiquidityViaHookOnly();
     error CannotWithdrawMoreThanDeposited();
+    error CanOnlyModifyLiquidityViaHook();
     error InvalidTickRange();
     error NotDynamicFee();
     error NotEnoughDeposit();
@@ -54,7 +56,9 @@ contract AmpoHook is BaseHook {
 
     /// @notice Parameters that need to be specified when initializing a pool.
     /// `tickLower` and `tickUpper` determine a concentrated liquidity range that all LP deposits
-    /// must use.
+    /// must use. `lpFee` is the fixed LP fee as a multiple of 1_000_000. `payInTokenZero` determines
+    /// whether rent and funding are paid in token0 or token1.
+    /// @dev Dynamic fee flag needs to be set in the pool key so we have to pass in the `lpFee` here.
     struct InitializeParams {
         int24 tickLower;
         int24 tickUpper;
@@ -93,14 +97,9 @@ contract AmpoHook is BaseHook {
     /// Period is in blocks.
     uint256 public constant MIN_HEALTHY_PERIOD = 100;
 
-    /// @notice Use LP fee of 30 bps when there's no manager.
-    uint24 public constant LP_FEE_WHEN_NO_MANAGER = 3_000 | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-
     mapping(PoolId => PoolState) public pools;
 
-    /// @notice When a pool is initialized with this hook, the fixed range must be specified.
-    // mapping(PoolId => int24) public tickLower;
-    // mapping(PoolId => int24) public tickUpper;
+    /// TODO: Move below comments elsewhere
 
     /// @notice Store notional value of option. This is the amount of token0 that user
     /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
@@ -171,7 +170,8 @@ contract AmpoHook is BaseHook {
         });
     }
 
-    /// @notice Check dynamic fee flag is set and set up initial pool state.
+    /// @notice Ensure dynamic fee flag is set and the given `hookData` is valid and set up initial
+    /// pool state.
     function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata hookData)
         external
         override
@@ -221,7 +221,7 @@ contract AmpoHook is BaseHook {
         poolManagerOnly
         returns (bytes4)
     {
-        revert ModifyLiquidityViaHookOnly();
+        revert CanOnlyModifyLiquidityViaHook();
     }
 
     /// @notice Redirect swap fees to the manager of the pool.

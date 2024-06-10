@@ -23,11 +23,12 @@ contract AmpoHookTest is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
 
-    address MANAGER = address(0x1000);
+    // Addresses for pranking
+    address constant MANAGER = address(0x1000);
 
-    int24 TICK_SPACING = 60;
+    int24 constant TICK_SPACING = 60;
 
-    // Default initialization parameters with tick range of -60 to 60 and 1% fee
+    // @notice Default initialization parameters with tick range of -60 to 60 and 1% fee
     bytes constant INIT_PARAMS =
         abi.encode(AmpoHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
 
@@ -164,10 +165,6 @@ contract AmpoHookTest is Test, Deployers {
             ZERO_BYTES
         );
     }
-
-
-
-
 
     //     console2.log("balance0 change", int256(key.currency0.balanceOfSelf()) - int256(balance0));
     //     console2.log("balance1 change", int256(key.currency1.balanceOfSelf()) - int256(balance1));
