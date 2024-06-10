@@ -26,13 +26,14 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
  *
  *          Perpetual options are options that never expire and can be exercise at any point in the future.
  *          They can be synthetically constructed by borrowing a narrow Uniswap concentrated liquidity
- *          position, withdrawing it and swapping for one of the tokens if needed. Users with an open
- *          perpetual options position have to pay funding each block, similar to funding on perpetual futures.
+ *          position, withdrawing it and swapping for one of the tokens. Users with an open
+ *          perpetual options position pay funding each block, similar to funding on perpetual futures.
  *
  *          The pricing of these options is auction-managed. A continuous auction is run
  *          where anyone can bid for the right to change the funding rate and to receive funding from
- *          open options positions. They are therefore incentivized to set it in a way that maximizes
- *          their profit and the revenue that goes to LPs via the auction.
+ *          open options positions. The amount they bid is called the rent and is distributed among in-range LPs
+ *          each block. Managers are therefore incentivized to set the funding in a way that maximizes
+ *          their profit and most of their profits go to LPs via the auction mechanism.
  */
 contract AuctionManagedOptionsHook is BaseHook {
     using CurrencyLibrary for Currency;
@@ -50,6 +51,8 @@ contract AuctionManagedOptionsHook is BaseHook {
     error OnlyManager();
 
     /// @notice Parameters that need to be specified when initializing a pool.
+    /// `tickLower` and `tickUpper` determine a concentrated liquidity range that all LP deposits
+    /// must use.
     struct InitializeParams {
         int24 tickLower;
         int24 tickUpper;
@@ -59,12 +62,12 @@ contract AuctionManagedOptionsHook is BaseHook {
     struct PoolState {
         int24 tickLower;
         int24 tickUpper;
-        uint256 notionalPerLiquidity;
+        uint256 notionalPerLiquidity; // Used for calculations when minting and burning options
         address manager;
-        uint256 rent;
-        uint256 fundingRate;
-        uint256 cumulativeFunding;
-        uint256 lastCumulativeFundingUpdateBlock;
+        uint256 rent; // Rent is amount of ETH paid per block by the manager to LPs
+        uint256 fundingRate; // Funding rate is amount of ETH paid per block per option by option holders to the manager
+        uint256 cumulativeFunding; // Cumulative funding keeps track of the sum of `fundingRate` across all blocks
+        uint256 lastCumulativeFundingUpdateBlock; // Last block `cumulativeFunding` was updated
     }
 
     /// @notice Data passed to `PoolManager.unlock` when modifying liquidity
@@ -121,21 +124,16 @@ contract AuctionManagedOptionsHook is BaseHook {
     /// how much funding the user owes to the manager.
     mapping(PoolId => mapping(address => uint256)) public cumulativeFundingAtLastCharge;
 
+    // @notice Block at which user was last charged rent and funding.
     mapping(PoolId => mapping(address => uint256)) public lastPaymentBlock;
 
-    // TODO: Rename to balanceOf?
-    // TODO: Add events on transfer/mint etc
+    /// @notice How much ETH user has deposited into the contract.
     mapping(PoolId => mapping(address => uint256)) public balances;
+
+    /// @notice User's options position size.
     mapping(PoolId => mapping(address => uint256)) public positions;
 
-    /**
-     * Constructor
-     */
     constructor(IPoolManager _manager) BaseHook(_manager) {}
-
-    /**
-     * Hook Permissions
-     */
 
     /// @notice Specify hook permissions. Hook implements `beforeInitialize`, `beforeAddLiquidity`
     /// and `beforeSwap`. `beforeSwapReturnDelta` is also set to charge custom swap fees that go
@@ -171,6 +169,8 @@ contract AuctionManagedOptionsHook is BaseHook {
 
         // Parse hook data to get the tick range. This is a fixed range that every LP deposit must use.
         InitializeParams memory params = abi.decode(hookData, (InitializeParams));
+
+        // Initialize pool state
         pools[key.toId()] = PoolState({
             tickLower: params.tickLower,
             tickUpper: params.tickUpper,
@@ -378,8 +378,11 @@ contract AuctionManagedOptionsHook is BaseHook {
     function setFunding(PoolKey calldata key, uint256 fundingRate) external {
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
+
+        // Only manager can set funding
         if (msg.sender != pool.manager) revert OnlyManager();
 
+        // Update cumulative funding
         pool.cumulativeFunding = calcCumulativeFunding(key);
         pool.lastCumulativeFundingUpdateBlock = block.number;
 
