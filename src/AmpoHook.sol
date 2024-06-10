@@ -21,7 +21,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 /**
- * @title   AuctionManagedOptionsHook
+ * @title   AmpoHook
  * @author  mxwtnb
  * @notice  A Uniswap V4 hook that lets users trade perpetual options.
  *
@@ -36,7 +36,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
  *          each block. Managers are therefore incentivized to set the funding in a way that maximizes
  *          their profit and most of their profits go to LPs via the auction mechanism.
  */
-contract AuctionManagedOptionsHook is BaseHook {
+contract AmpoHook is BaseHook {
     using CurrencyLibrary for Currency;
     using CurrencySettleTake for Currency;
     using LPFeeLibrary for uint24;

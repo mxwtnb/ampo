@@ -9,7 +9,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
-import {AuctionManagedOptionsHook} from "../src/AuctionManagedOptionsHook.sol";
+import {AmpoHook} from "../src/AmpoHook.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
@@ -19,7 +19,7 @@ import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
-contract AuctionManagedOptionsHookTest is Test, Deployers {
+contract AmpoHookTest is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
 
@@ -29,9 +29,9 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
 
     // Default initialization parameters with tick range of -60 to 60 and 1% fee
     bytes constant INIT_PARAMS =
-        abi.encode(AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
+        abi.encode(AmpoHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
 
-    AuctionManagedOptionsHook public hook;
+    AmpoHook public hook;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -44,8 +44,8 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
                     | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
             )
         );
-        deployCodeTo("AuctionManagedOptionsHook.sol", abi.encode(manager), hookAddress);
-        hook = AuctionManagedOptionsHook(hookAddress);
+        deployCodeTo("AmpoHook.sol", abi.encode(manager), hookAddress);
+        hook = AmpoHook(hookAddress);
 
         // Also approve hook to spend our tokens
         IERC20(Currency.unwrap(currency0)).approve(hookAddress, type(uint256).max);
@@ -64,32 +64,32 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         PoolKey memory badKey = PoolKey(currency0, currency1, feeWithNoDynamicFlag, TICK_SPACING, hook);
 
         // Should fail because no dynamic fee flag is set
-        vm.expectRevert(AuctionManagedOptionsHook.NotDynamicFee.selector);
+        vm.expectRevert(AmpoHook.NotDynamicFee.selector);
         manager.initialize(badKey, SQRT_PRICE_1_1, INIT_PARAMS);
     }
 
     function test_beforeInitialize_checkRanges() public {
-        AuctionManagedOptionsHook.InitializeParams memory params;
+        AmpoHook.InitializeParams memory params;
         PoolKey memory key2 = PoolKey(currency0, currency1, 20_000 | LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, hook);
 
         // Should fail because not multiple of `tickSpacing`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -61, tickUpper: 60, lpFee: 10_000, payInTokenZero: true});
-        vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
+        params = AmpoHook.InitializeParams({tickLower: -61, tickUpper: 60, lpFee: 10_000, payInTokenZero: true});
+        vm.expectRevert(AmpoHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because not multiple of `tickSpacing`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -60, tickUpper: -33, lpFee: 10_000, payInTokenZero: true});
-        vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
+        params = AmpoHook.InitializeParams({tickLower: -60, tickUpper: -33, lpFee: 10_000, payInTokenZero: true});
+        vm.expectRevert(AmpoHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because `tickLower` is not less than `tickUpper`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -180, lpFee: 10_000, payInTokenZero: true});
-        vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
+        params = AmpoHook.InitializeParams({tickLower: -180, tickUpper: -180, lpFee: 10_000, payInTokenZero: true});
+        vm.expectRevert(AmpoHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
 
         // Should fail because `tickLower` is not less than `tickUpper`
-        params = AuctionManagedOptionsHook.InitializeParams({tickLower: -180, tickUpper: -240, lpFee: 10_000, payInTokenZero: true});
-        vm.expectRevert(AuctionManagedOptionsHook.InvalidTickRange.selector);
+        params = AmpoHook.InitializeParams({tickLower: -180, tickUpper: -240, lpFee: 10_000, payInTokenZero: true});
+        vm.expectRevert(AmpoHook.InvalidTickRange.selector);
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
     }
 
@@ -105,8 +105,8 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
         assertTrue(payInTokenZero);
 
         PoolKey memory key2 = PoolKey(currency0, currency1, 20_000 | LPFeeLibrary.DYNAMIC_FEE_FLAG, TICK_SPACING, hook);
-        AuctionManagedOptionsHook.InitializeParams memory params =
-            AuctionManagedOptionsHook.InitializeParams({tickLower: -120, tickUpper: 180, lpFee: 10_000, payInTokenZero: false});
+        AmpoHook.InitializeParams memory params =
+            AmpoHook.InitializeParams({tickLower: -120, tickUpper: 180, lpFee: 10_000, payInTokenZero: false});
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
         (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,) = hook.pools(key2.toId());
         assertEq(tickLower, -120);
@@ -117,7 +117,7 @@ contract AuctionManagedOptionsHookTest is Test, Deployers {
 
     function test_beforeAddLiquidity_blockModifyLiquidityUnlessViaHook() public {
         // Should fail as we aren't allowed to add liquidity to the pool via a router
-        vm.expectRevert(AuctionManagedOptionsHook.ModifyLiquidityViaHookOnly.selector);
+        vm.expectRevert(AmpoHook.ModifyLiquidityViaHookOnly.selector);
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 100 ether, salt: 0}),
