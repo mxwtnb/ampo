@@ -159,11 +159,11 @@ contract AuctionManagedOptionsHook is BaseHook {
         });
     }
 
-    /// @notice Revert if swap fee is not set to zero. Swap fee should be zero
-    /// as we instead charge a fee in `beforeSwap` and send it to the manager.
+    /// @notice Check dynamic fee flag is set and set up initial pool state.
     function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata hookData)
         external
         override
+        poolManagerOnly
         returns (bytes4)
     {
         // Pool must have dynamic fee flag set.
@@ -199,17 +199,20 @@ contract AuctionManagedOptionsHook is BaseHook {
     // TODO: change to beforeModifyPosition?
     function beforeAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
         external
-        pure
+        view
         override
+        poolManagerOnly
         returns (bytes4)
     {
         revert AddLiquidityNotAllowed();
         // return this.beforeAddLiquidity.selector;
     }
 
+    /// @notice Redirect swap fees to the manager of the pool.
     function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         override
+        poolManagerOnly
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         address manager = pools[key.toId()].manager;
