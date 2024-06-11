@@ -4,19 +4,18 @@ pragma solidity ^0.8.25;
 import {Test} from "forge-std/Test.sol";
 import {console2} from "forge-std/console2.sol";
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-
-import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {AmpoHook} from "../src/AmpoHook.sol";
-import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {CurrencyLibrary, Currency} from "v4-core/types/Currency.sol";
+import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
-import {CurrencyLibrary, Currency} from "v4-core/types/Currency.sol";
-import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 contract AmpoHookTest is Test, Deployers {

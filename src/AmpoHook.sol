@@ -29,14 +29,27 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
  *
  *          Perpetual options are options that never expire and can be exercised at any point in the future.
  *          They can be synthetically constructed by borrowing a narrow Uniswap concentrated liquidity
- *          position, withdrawing it and swapping for one of the tokens. Users with an open
- *          perpetual options position pay funding each block, similar to funding on perpetual futures.
+ *          position and withdrawing the tokens inside it. Users with an open perpetual options position
+ *          pay funding each block, analogous to funding on perpetual futures.
  *
- *          The pricing of these options is auction-managed. A continuous auction is run
- *          where anyone can bid for the right to change the funding rate and to receive funding from
- *          open options positions. The amount they bid is called the rent and is distributed among in-range LPs
- *          each block. Managers are therefore incentivized to set the funding in a way that maximizes
- *          their profit and most of their profits go to LPs via the auction mechanism.
+ *          The pricing of these options is auction-managed. A continuous auction is run where anyone can
+ *          place bids and modify their bids at any time. The current highest bidder is called the
+ *          manager. The manager pays their bid amount, called rent, each block to LPs. In return, they
+ *          get to set the funding rate for options holders and receive funding from all options positions
+ *          as well as LP fees from all swaps.
+ *
+ *          In summary:
+ *          - Managers pay rent to LPs each block
+ *          - Managers receive funding from options holders each block
+ *          - Managers receive LP fees each swap
+ *
+ *          Managers are therefore able to make a profit if they can set the funding in a smart way, not
+ *          too low which leaves potential income on the table and not too high which discourages users
+ *          from buying and holding options. They are incentivized to come up with better ways to
+ *          calculate the best funding in order to maximise their profit and be able to bid more in the
+ *          manager auction. With a set of competitive managers who are constantly trying to outbid each
+ *          other, the system should be able to find the best funding rate for options holders and most
+ *          of the potential revenue should flow to LPs.
  */
 contract AmpoHook is BaseHook {
     using CurrencyLibrary for Currency;
@@ -106,36 +119,6 @@ contract AmpoHook is BaseHook {
 
     mapping(PoolId => PoolState) public pools;
 
-    /// TODO: Move below comments elsewhere
-
-    /// @notice Store notional value of option. This is the amount of token0 that user
-    /// will receive if they exercise the option. For example, if the pool is the ETH/DAI pool
-    /// and token0 is ETH, then the notional value of 1 option would just be 1 ETH.
-    /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
-    /// value is calculated by seeing how much the LP position that was withdrawn would be
-    /// worth if it's completely in terms of token0.
-    // mapping(PoolId => uint256) public amount0PerLiquidity;
-
-    /// @notice The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
-    /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
-    // mapping(PoolId => address) public manager;
-
-    /// @notice "Rent" is the amount of ETH that the manager pays to LPs per block
-    // mapping(PoolId => uint256) public rent;
-
-    /// @notice Block at which rent was last charged. Used to keep track of how much rent the manager owes.
-    // mapping(PoolId => mapping(address => uint256)) public lastRentPaidBlock;
-
-    /// @notice Current funding rate of the pool. This is the amount option holders pay per block to the manager.
-    /// It can be changed at any time by the manager.
-    // mapping(PoolId => uint256) public fundingRate;
-
-    /// @notice Cumulative funding of the pool. This is the sum of `fundingRate` across all blocks.
-    // mapping(PoolId => uint256) public cumulativeFunding;
-
-    /// @notice Block at which `cumulativeFunding` was last updated
-    // mapping(PoolId => mapping(address => uint256)) public lastFundingPaidBlock;
-
     /// @notice Cumulative funding at the last time the user was charged. Used to keep track of
     /// how much funding the user owes to the manager.
     mapping(PoolId => mapping(address => uint256)) public cumulativeFundingAtLastCharge;
@@ -151,7 +134,7 @@ contract AmpoHook is BaseHook {
     /// @dev Hook needs to own all the liquidity so that it's able to withdraw it when options are minted.
     mapping(PoolId => mapping(address => uint256)) public liquidity;
 
-    /// @notice User's options position size.
+    /// @notice Position sizes of token0 call and token1 call of each user.
     mapping(PoolId => mapping(address => uint256)) public positions0;
     mapping(PoolId => mapping(address => uint256)) public positions1;
 
@@ -269,6 +252,9 @@ contract AmpoHook is BaseHook {
         return (this.beforeSwap.selector, toBeforeSwapDelta(-fees.toInt128(), 0), LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 
+    /// @notice Bid in the auction to become the manager of a pool or modify the bid if already the manager.
+    /// @param key The pool to bid in
+    /// @param rent The amount of tokens to pay per block to LPs. The token is determined by `payInTokenZero`
     function bid(PoolKey calldata key, uint256 rent) external {
         PoolId poolId = key.toId();
         if (balances[poolId][msg.sender] < rent * MIN_DEPOSIT_PERIOD) {
@@ -280,10 +266,10 @@ contract AmpoHook is BaseHook {
             // Modify or cancel bid
             pool.rent = rent;
         } else if (rent > pool.rent) {
-            // Submit new highest bid
-            address prevManager = pool.manager;
-            _pokeUserBalance(key, prevManager);
+            // Ensure current manager's balance and payments are up-to-date
+            _pokeUserBalance(key, pool.manager);
 
+            // Usurp current manager
             pool.manager = msg.sender;
             pool.rent = rent;
         }
@@ -420,7 +406,7 @@ contract AmpoHook is BaseHook {
         if (liquidity_ < 0) revert CannotWithdrawMoreThanDeposited();
         liquidity[key.toId()][msg.sender] = uint256(liquidity_);
 
-        // Sweep any native eth balance to the user
+        // Sweep any native ETH balance to the user
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
             CurrencyLibrary.NATIVE.transfer(msg.sender, ethBalance);
@@ -487,10 +473,15 @@ contract AmpoHook is BaseHook {
         return pool.cumulativeFunding + blocksSinceLastUpdate * pool.fundingRate;
     }
 
-    /// @notice Called by a user to modify their options position in a pool
+    /// @notice Called by a user to modify their options position in a pool. There are two types of
+    /// options supported: token0 calls and token1 calls. `positionDelta0` and `positionDelta1` are
+    /// used to modify the user's position in each type of option. Positive values mean open position
+    /// (or buy/mint) and negative values mean close or exercise the position (or sell/burn).
+    /// Note that put options are also supported. A token0 put is equivalent to a token1 call and a
+    /// token1 put is equivalent to a token0 call.
     /// @param key The pool to modify the position in
-    /// @param positionDelta0 The change in position - positive means buy and negative means sell
-    /// @param positionDelta1 The change in position - positive means buy and negative means sell
+    /// @param positionDelta0 The change in position0 - positive means buy and negative means sell
+    /// @param positionDelta1 The change in position1 - positive means buy and negative means sell
     /// @return delta The change in the user's balance in the two tokens
     function modifyOptionsPosition(PoolKey calldata key, int256 positionDelta0, int256 positionDelta1)
         external
@@ -499,7 +490,23 @@ contract AmpoHook is BaseHook {
         delta = _modifyOptionsPositionForUser(key, positionDelta0, positionDelta1, msg.sender);
     }
 
-    /// @dev Internal method called by `modifyOptionsPosition` and `liquidate` to modify a user's options position
+    /// @notice Internal method called by `modifyOptionsPosition` and `liquidate` to modify a user's
+    /// options position. For out-of-the-money perpetual options, the upfront cost is zero.
+    /// For in-the-money options, the user has to deposit the difference between the strike price and
+    /// the current price.
+    ///
+    /// Example 1: The ETH/DAI pool uses a narrow range around 3000 and the current price is 2000.
+    /// If a user wants to buy 1 ETH call, they don't have to pay anything upfront. The hook will
+    /// withdraw 1 ETH from the pool and store it as a claim token in the Uniswap PoolManager. Let's say
+    /// the price rises to 4000 and the user exercises their option. The hook will give them the 1 ETH
+    /// and will receive 3000 DAI from them (so user makes $1000 profit) and can deposit the 3000 DAI
+    /// back, replenishing the liquidity.
+    ///
+    /// Example 2: The current price is 4000. If a user wants to buy 1 ETH call, they have to deposit
+    /// 1 ETH into the hook. The hook will withdraw 3000 DAI from the pool and send it to the user, so
+    /// the user has only paid $1000 upfront for the option. If the price rises to 5000 and the user
+    /// exercises their option, the hook will give them 1 ETH and will receive 3000 DAI from them (so
+    /// user makes $1000 profit) and can deposit the 3000 DAI back as liquidity.
     function _modifyOptionsPositionForUser(
         PoolKey calldata key,
         int256 positionDelta0,
@@ -509,13 +516,16 @@ contract AmpoHook is BaseHook {
         _pokeManagerBalance(key);
         _pokeUserBalance(key, user);
 
+        // Calculate notional values of token0 and token1. For example, the notional value of 2 ETH calls
+        // is 2 ETH. This is used to calculate how much tokens the hook needs to settle or take from the
+        // user to ensure it is fully collateralized.
         int256 positionDelta = positionDelta0 + positionDelta1;
         int256 absPositionDelta0 = positionDelta0 > 0 ? positionDelta0 : -positionDelta0;
         int256 absPositionDelta1 = positionDelta1 > 0 ? positionDelta1 : -positionDelta1;
         uint256 notional0 = absPositionDelta0.toUint256() * pools[key.toId()].amount0PerLiquidity / 1e18;
         uint256 notional1 = absPositionDelta1.toUint256() * pools[key.toId()].amount1PerLiquidity / 1e18;
 
-        // Modify liquidity owned by the hook, equivalent to minting or burning options
+        // Call `PoolManager.unlock` which will call `unlockCallback` in this hook to settle or take tokens
         delta = abi.decode(
             poolManager.unlock(
                 abi.encode(
@@ -529,7 +539,7 @@ contract AmpoHook is BaseHook {
         positions0[key.toId()][user] = (positions0[key.toId()][user].toInt256() + positionDelta0).toUint256();
         positions1[key.toId()][user] = (positions1[key.toId()][user].toInt256() + positionDelta1).toUint256();
 
-        // Sweep any native eth balance to the user
+        // Sweep any native ETH balance to the user
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
             CurrencyLibrary.NATIVE.transfer(user, ethBalance);
@@ -538,7 +548,9 @@ contract AmpoHook is BaseHook {
 
     /// @notice Liquidate a user if their balance can't cover payments for a certain period.
     /// Reverts if the user's balance is healthy enough. Can be called by anyone and rewards them
-    /// if the liquidation is successful.
+    /// if the liquidation is successful. Note that this liquidation is significantly less risky than
+    /// liquidations in lending protocols or perp dexs as user's balance doesn't fluctuate with price
+    /// movements but only decreases gradually as funding and rent are continuously charged.
     /// @param key Pool for which user's balance is liquidated
     /// @param user User to liquidate
     function liquidate(PoolKey calldata key, address user) external {
@@ -552,11 +564,11 @@ contract AmpoHook is BaseHook {
         uint256 paymentPerBlock = 0;
         bool isManager = user == pool.manager;
         if (isManager) {
-            // Rent payment if the user is the manager of the pool
+            // Add rent payment if the user is the manager of the pool
             paymentPerBlock += pool.rent;
         }
 
-        // Funding payment if user has options position open
+        // Add funding payment if user has options position open
         paymentPerBlock += pool.fundingRate * positions0[poolId][user];
         paymentPerBlock += pool.fundingRate * positions1[poolId][user];
 
@@ -571,7 +583,7 @@ contract AmpoHook is BaseHook {
             pool.manager = address(0);
         }
 
-        // Force close their positions
+        // Force close their options positions
         _modifyOptionsPositionForUser(
             key, -positions0[poolId][user].toInt256(), -positions1[poolId][user].toInt256(), user
         );
