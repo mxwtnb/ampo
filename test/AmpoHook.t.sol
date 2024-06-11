@@ -10,6 +10,7 @@ import {CurrencyLibrary, Currency} from "v4-core/types/Currency.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
+import {MockERC20} from "solmate/test/utils/mocks/MockERC20.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
@@ -24,6 +25,8 @@ contract AmpoHookTest is Test, Deployers {
 
     // Addresses for pranking
     address constant MANAGER = address(0x1000);
+    address constant MANAGER2 = address(0x1001);
+    address constant USER = address(0x1002);
 
     int24 constant TICK_SPACING = 60;
 
@@ -31,11 +34,15 @@ contract AmpoHookTest is Test, Deployers {
     bytes constant INIT_PARAMS =
         abi.encode(AmpoHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
 
+    IPoolManager poolManager;
     AmpoHook public hook;
 
     function setUp() public {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
+
+        // We use the variable name `poolManager` so that it's not confusing with our notion of managers.
+        poolManager = manager;
 
         // Deploy our hook
         address hookAddress = address(
@@ -57,6 +64,23 @@ contract AmpoHookTest is Test, Deployers {
 
         // Add some liquidity
         hook.modifyLiquidity(key, 100 ether);
+
+        // Set up users
+        _setUpUser(MANAGER);
+        _setUpUser(MANAGER2);
+        _setUpUser(USER);
+    }
+
+    function _setUpUser(address user) internal {
+        // Mint tokens for user
+        MockERC20(Currency.unwrap(currency0)).mint(user, 100 ether);
+        MockERC20(Currency.unwrap(currency1)).mint(user, 100 ether);
+
+        // Approve hook to spend user's tokens
+        vm.startPrank(user);
+        IERC20(Currency.unwrap(currency0)).approve(address(hook), type(uint256).max);
+        IERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
+        vm.stopPrank();
     }
 
     function test_beforeInitialize_dynamicFeeOnly() public {
@@ -127,7 +151,7 @@ contract AmpoHookTest is Test, Deployers {
 
     function test_beforeSwap_feesChargedWhenNoManager() public {
         // Swap 0.001 token0 -> token1
-        BalanceDelta delta = _swap(true, 0.001 ether);
+        BalanceDelta delta = _swap(key, true, 0.001 ether);
 
         // Check loss is around 1%. Initial price was set to 1 and price impact should be small so
         // loss should be similar to the default fee of 1%.
@@ -136,25 +160,272 @@ contract AmpoHookTest is Test, Deployers {
         assertLt(loss, 0.0101e18);
     }
 
-    // function test_beforeSwap_feesChargedAndGoToManager() public {
-    //     // Manager bids and becomes manager
-    //     vm.startPrank(MANAGER);
-    //     hook.deposit(key, 100 ether);
-    //     hook.bid(key, 0.000_001 ether);
-    //     vm.stopPrank();
+    function test_beforeSwap_feesChargedAndGoToManager() public {
+        // Manager bids and becomes manager
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        vm.stopPrank();
 
-    //     // Swap 0.001 token0 -> token1
-    //     BalanceDelta delta = _swap(true, 0.001 ether);
-    // }
+        // Check claim token balance is zero
+        assertEq(poolManager.balanceOf(MANAGER, key.currency0.toId()), 0);
+        assertEq(poolManager.balanceOf(MANAGER, key.currency1.toId()), 0);
 
-    function _swap(bool zeroForOne, int256 amountSpecified) internal returns (BalanceDelta delta) {
+        // Swap 0.001 token0 -> token1
+        BalanceDelta delta = _swap(key, true, 0.001 ether);
+
+        // Check loss is around 1%. Initial price was set to 1 and price impact should be small so
+        // loss should be similar to the default fee of 1%.
+        int128 loss = 1e18 + delta.amount1() * 1e18 / delta.amount0();
+        assertGt(loss, 0.0099e18);
+        assertLt(loss, 0.0101e18);
+
+        // Check manager has received fees as claim tokens
+        assertEq(poolManager.balanceOf(MANAGER, key.currency0.toId()), 0);
+        assertEq(poolManager.balanceOf(MANAGER, key.currency1.toId()), 0.00001e18);
+    }
+
+    function test_bid() public {
+        // Check there is no manager
+        assertEq(_pool(key).manager, address(0));
+
+        // Manager bids and becomes manager
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        vm.stopPrank();
+
+        // Check manager is now set
+        assertEq(_pool(key).manager, MANAGER);
+        assertEq(_pool(key).rent, 0.000_001 ether);
+
+        // Manager modifies bid
+        vm.prank(MANAGER);
+        hook.bid(key, 0.000_002 ether);
+
+        // Check rent has been updated
+        assertEq(_pool(key).rent, 0.000_002 ether);
+
+        // Manager2 under-bids so nothing happens
+        vm.startPrank(MANAGER2);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        vm.stopPrank();
+
+        // Check no change
+        assertEq(_pool(key).manager, MANAGER);
+        assertEq(_pool(key).rent, 0.000_002 ether);
+
+        // Manager2 out-bids so usurps Manager
+        vm.prank(MANAGER2);
+        hook.bid(key, 0.000_003 ether);
+
+        // Check manager has changed
+        assertEq(_pool(key).manager, MANAGER2);
+        assertEq(_pool(key).rent, 0.000_003 ether);
+    }
+
+    function test_bid_rentChargedOverTime() public {
+        // Manager bids and becomes manager and sets funding
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.001 ether);
+        vm.stopPrank();
+
+        uint256 balance0 = IERC20(Currency.unwrap(currency0)).balanceOf(USER);
+
+        // User deposits
+        vm.prank(USER);
+        hook.modifyLiquidity(key, 50 ether);
+
+        // Manager balance is 10 eth
+        assertEq(hook.getBalance(key, MANAGER), 10 ether);
+
+        // Skip forward 1000 blocks
+        vm.roll(block.number + 1000);
+
+        // Manager balance is less than 10 eth
+        assertLt(hook.getBalance(key, MANAGER), 10 ether);
+
+        // User withdraws
+        vm.prank(USER);
+        hook.modifyLiquidity(key, -50 ether);
+
+        // Check user has received rent
+        assertGt(IERC20(Currency.unwrap(currency0)).balanceOf(USER), balance0);
+    }
+
+    function test_deposit_withdraw() public {
+        // Check balance is 0
+        assertEq(hook.balanceOf(key.toId(), USER), 0);
+
+        uint256 balance = IERC20(Currency.unwrap(currency0)).balanceOf(USER);
+
+        // Deposit 10
+        vm.prank(USER);
+        hook.deposit(key, 10 ether);
+
+        // Check balance is 10 and user has 10 less tokens
+        assertEq(hook.balanceOf(key.toId(), USER), 10 ether);
+        assertEq(hook.getBalance(key, USER), 10 ether);
+        assertEq(IERC20(Currency.unwrap(currency0)).balanceOf(USER), balance - 10 ether);
+        assertEq(hook.totalSupply(key.toId()), 10 ether);
+
+        // Can't withdraw 11
+        vm.expectRevert(AmpoHook.CannotWithdrawMoreThanDeposited.selector);
+        vm.prank(USER);
+        hook.withdraw(key, 11 ether);
+
+        // Withdraw 6
+        vm.prank(USER);
+        hook.withdraw(key, 6 ether);
+
+        // Check balance is 4 and user has 6 more tokens
+        assertEq(hook.balanceOf(key.toId(), USER), 4 ether);
+        assertEq(hook.getBalance(key, USER), 4 ether);
+        assertEq(IERC20(Currency.unwrap(currency0)).balanceOf(USER), balance - 4 ether);
+        assertEq(hook.totalSupply(key.toId()), 4 ether);
+    }
+
+    function test_modifyLiquidity() public {
+        // Check liquidity is 0
+        assertEq(hook.liquidityOf(key.toId(), USER), 0);
+
+        uint256 balance0 = IERC20(Currency.unwrap(currency0)).balanceOf(USER);
+        uint256 balance1 = IERC20(Currency.unwrap(currency1)).balanceOf(USER);
+
+        // Add 10
+        vm.prank(USER);
+        hook.modifyLiquidity(key, 10 ether);
+
+        // Check liquidity is 10
+        assertEq(hook.liquidityOf(key.toId(), USER), 10 ether);
+
+        // Check user has paid tokens
+        assertLt(IERC20(Currency.unwrap(currency0)).balanceOf(USER), balance0);
+        assertLt(IERC20(Currency.unwrap(currency1)).balanceOf(USER), balance1);
+
+        balance0 = IERC20(Currency.unwrap(currency0)).balanceOf(USER);
+        balance1 = IERC20(Currency.unwrap(currency1)).balanceOf(USER);
+
+        // Can't remove 11
+        vm.expectRevert(AmpoHook.CannotWithdrawMoreThanDeposited.selector);
+        vm.prank(USER);
+        hook.modifyLiquidity(key, -11 ether);
+
+        // Remove 6
+        vm.prank(USER);
+        hook.modifyLiquidity(key, -6 ether);
+
+        // Check liquidity is 4
+        assertEq(hook.liquidityOf(key.toId(), USER), 4 ether);
+
+        // Check user has received tokens
+        assertGt(IERC20(Currency.unwrap(currency0)).balanceOf(USER), balance0);
+        assertGt(IERC20(Currency.unwrap(currency1)).balanceOf(USER), balance1);
+    }
+
+    function test_setFundingRate() public {
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        vm.stopPrank();
+
+        // Check funding rate is 0
+        assertEq(_pool(key).fundingRate, 0);
+
+        // Set funding rate to 0.0001
+        vm.prank(MANAGER);
+        hook.setFundingRate(key, 0.0001 ether);
+
+        // Check funding rate is 0.0001
+        assertEq(_pool(key).fundingRate, 0.0001 ether);
+    }
+
+    function test_setFundingRate_revertsIfNotManager() public {
+        vm.expectRevert(AmpoHook.OnlyManager.selector);
+        hook.setFundingRate(key, 0.0001 ether);
+    }
+
+    function test_modifyOptionsPosition() public {
+        vm.startPrank(USER);
+        hook.modifyOptionsPosition(key, 0.0001 ether, 0.0002 ether);
+
+        assertEq(hook.positions0(key.toId(), USER), 0.0001 ether);
+        assertEq(hook.positions1(key.toId(), USER), 0.0002 ether);
+    }
+
+    function test_modifyOptionsPosition_fundingChargedOverTime() public {
+        // Manager bids and becomes manager and sets funding
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        hook.setFundingRate(key, 0.0001 ether);
+        vm.stopPrank();
+
+        // User opens position
+        vm.startPrank(USER);
+        hook.deposit(key, 1 ether);
+        hook.modifyOptionsPosition(key, 0.0001 ether, 0.0002 ether);
+        vm.stopPrank();
+
+        // User balance is 1 eth
+        assertEq(hook.getBalance(key, USER), 1 ether);
+
+        // Skip forward 1000 blocks
+        vm.roll(block.number + 1000);
+
+        // User balance is less than 1 eth
+        assertLt(hook.getBalance(key, USER), 1 ether);
+    }
+
+    function test_liquidate() public {
+        // Manager bids and becomes manager and sets funding
+        vm.startPrank(MANAGER);
+        hook.deposit(key, 10 ether);
+        hook.bid(key, 0.000_001 ether);
+        hook.setFundingRate(key, 0.0001 ether);
+        vm.stopPrank();
+
+        // User opens position without collateral
+        vm.startPrank(USER);
+        hook.modifyOptionsPosition(key, 0.0001 ether, 0.0002 ether);
+        vm.stopPrank();
+
+        // Skip forward 1000 blocks
+        vm.roll(block.number + 1000);
+
+        hook.liquidate(key, USER);
+
+        // Check user is liquidated
+        assertEq(hook.positions0(key.toId(), USER), 0);
+        assertEq(hook.positions1(key.toId(), USER), 0);
+        assertEq(hook.getBalance(key, USER), 0);
+    }
+
+    function test_liquidate_revertsIfHealthy() public {
+        // User opens position
+        vm.startPrank(USER);
+        hook.deposit(key, 10 ether);
+        hook.modifyOptionsPosition(key, 0.0001 ether, 0.0002 ether);
+        vm.stopPrank();
+
+        // Position is healthy so can't be liquidated
+        vm.expectRevert(AmpoHook.NotLiquidatable.selector);
+        hook.liquidate(key, USER);
+    }
+
+    /// @notice Helper method to do a swap without a slippage limit
+    function _swap(PoolKey memory key_, bool zeroForOne, int256 amountSpecified)
+        internal
+        returns (BalanceDelta delta)
+    {
         PoolSwapTest.TestSettings memory settings =
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
 
-        // Do not use slippage limit
         uint160 sqrtPriceLimitX96 = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
         delta = swapRouter.swap(
-            key,
+            key_,
             IPoolManager.SwapParams({
                 zeroForOne: zeroForOne,
                 amountSpecified: amountSpecified,
@@ -165,6 +436,33 @@ contract AmpoHookTest is Test, Deployers {
         );
     }
 
-    //     console2.log("balance0 change", int256(key.currency0.balanceOfSelf()) - int256(balance0));
-    //     console2.log("balance1 change", int256(key.currency1.balanceOfSelf()) - int256(balance1));
+    /// @notice Helper method to get the pool state as a PoolState struct
+    function _pool(PoolKey memory key_) internal view returns (AmpoHook.PoolState memory) {
+        (
+            int24 tickLower,
+            int24 tickUpper,
+            uint24 lpFee,
+            bool payInTokenZero,
+            address manager,
+            uint256 rent,
+            uint256 fundingRate,
+            uint256 cumulativeFunding,
+            uint256 lastCumulativeFundingUpdateBlock,
+            uint256 amount0PerLiquidity,
+            uint256 amount1PerLiquidity
+        ) = hook.pools(key_.toId());
+        return AmpoHook.PoolState({
+            tickLower: tickLower,
+            tickUpper: tickUpper,
+            lpFee: lpFee,
+            payInTokenZero: payInTokenZero,
+            manager: manager,
+            rent: rent,
+            fundingRate: fundingRate,
+            cumulativeFunding: cumulativeFunding,
+            lastCumulativeFundingUpdateBlock: lastCumulativeFundingUpdateBlock,
+            amount0PerLiquidity: amount0PerLiquidity,
+            amount1PerLiquidity: amount1PerLiquidity
+        });
+    }
 }

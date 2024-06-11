@@ -1,6 +1,6 @@
 ## Auction-managed perpetual options
 
-This is a Uniswap V4 hook that lets users trade perpetual options.
+A Uniswap V4 hook that lets users trade perpetual options.
 
 ### Background
 
@@ -8,7 +8,7 @@ This was built and submitted for the [Hookathon C1](https://learnweb3.learnweb3.
 
 Feel free to check out the [accompanying slides](https://docs.google.com/presentation/d/1xeaBmTHIDDWf5YchmquMXHaOp3F_LkDre-ubl_WtfKI/) for an overview of the motivation behind the project as well as how the mechanism works.
 
-### Overview
+## Overview
 
 All functionality is built into a single hook contract in `src/AmpoHook.sol`. Unit tests are in `test/AmpoHook.t.sol`.
 
