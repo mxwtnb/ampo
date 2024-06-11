@@ -99,7 +99,7 @@ contract AmpoHookTest is Test, Deployers {
         int24 tickUpper;
         uint24 lpFee;
         bool payInTokenZero;
-        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,) = hook.pools(key.toId());
+        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,,) = hook.pools(key.toId());
         assertEq(tickLower, -60);
         assertEq(tickUpper, 60);
         assertEq(lpFee, 10_000);
@@ -109,7 +109,7 @@ contract AmpoHookTest is Test, Deployers {
         AmpoHook.InitializeParams memory params =
             AmpoHook.InitializeParams({tickLower: -120, tickUpper: 180, lpFee: 10_000, payInTokenZero: false});
         manager.initialize(key2, SQRT_PRICE_1_1, abi.encode(params));
-        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,) = hook.pools(key2.toId());
+        (tickLower, tickUpper, lpFee, payInTokenZero,,,,,,,) = hook.pools(key2.toId());
         assertEq(tickLower, -120);
         assertEq(tickUpper, 180);
         assertEq(lpFee, 10_000);
@@ -118,7 +118,7 @@ contract AmpoHookTest is Test, Deployers {
 
     function test_beforeAddLiquidity_blockModifyLiquidityUnlessViaHook() public {
         // Should fail as we aren't allowed to add liquidity to the pool via a router
-        vm.expectRevert(AmpoHook.ModifyLiquidityViaHookOnly.selector);
+        vm.expectRevert(AmpoHook.CanOnlyModifyLiquidityViaHook.selector);
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({tickLower: -60, tickUpper: 60, liquidityDelta: 100 ether, salt: 0}),

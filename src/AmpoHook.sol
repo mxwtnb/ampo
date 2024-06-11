@@ -56,8 +56,10 @@ contract AmpoHook is BaseHook {
 
     /// @notice Parameters that need to be specified when initializing a pool.
     /// `tickLower` and `tickUpper` determine a concentrated liquidity range that all LP deposits
-    /// must use. `lpFee` is the fixed LP fee as a multiple of 1_000_000. `payInTokenZero` determines
-    /// whether rent and funding are paid in token0 or token1.
+    /// must use. They correspond to the strike price of the call and put options minted from
+    /// the pool. The range should be wide enough to reliably capture fees when the price is in that
+    /// area but narrow enough to provide enough leverage. `lpFee` is the fixed LP fee as a multiple
+    /// of 1_000_000. `payInTokenZero` determines whether rent and funding are paid in token0 or token1.
     /// @dev Dynamic fee flag needs to be set in the pool key so we have to pass in the `lpFee` here.
     struct InitializeParams {
         int24 tickLower;
@@ -67,17 +69,22 @@ contract AmpoHook is BaseHook {
     }
 
     /// @notice State stored for each pool
+    /// `amount0PerLiquidity` and `amount1PerLiquidity` are the amounts of token0 and token1 an LP
+    /// position with 1e18 liquidity would hold if it contains only token0 or token1 respectively.
+    /// These values are precalculated in `beforeInitialize` and used when minting or burning options
+    /// to calculate how many tokens are held in each option.
     struct PoolState {
         int24 tickLower;
         int24 tickUpper;
         uint24 lpFee;
         bool payInTokenZero;
-        uint256 notionalPerLiquidity; // Used for calculations when minting and burning options
-        address manager;
-        uint256 rent; // Rent is amount of ETH paid per block by the manager to LPs
-        uint256 fundingRate; // Funding rate is amount of ETH paid per block per option by option holders to the manager
-        uint256 cumulativeFunding; // Cumulative funding keeps track of the sum of `fundingRate` across all blocks
+        address manager; // The highest bidder in the auction who sets the funding rate. 0x0 if no manager set.
+        uint256 rent; // Amount paid per block by the manager to LPs
+        uint256 fundingRate; // Amount paid per block per option by option holders to the manager
+        uint256 cumulativeFunding; // Keeps track of the sum of `fundingRate` across all blocks
         uint256 lastCumulativeFundingUpdateBlock; // Last block `cumulativeFunding` was updated
+        uint256 amount0PerLiquidity;
+        uint256 amount1PerLiquidity;
     }
 
     /// @notice Data passed to `PoolManager.unlock` when modifying liquidity
@@ -107,7 +114,7 @@ contract AmpoHook is BaseHook {
     /// Here, `amount`, the amount of options, is specified in liquidity units so the notional
     /// value is calculated by seeing how much the LP position that was withdrawn would be
     /// worth if it's completely in terms of token0.
-    // mapping(PoolId => uint256) public notionalPerLiquidity;
+    // mapping(PoolId => uint256) public amount0PerLiquidity;
 
     /// @notice The "Manager" of a pool is the highest bidder in the auction who has the sole right to set the option funding rate.
     /// The manager can be changed by submitting a higher bid. Set to 0x0 if no manager is set.
@@ -140,6 +147,8 @@ contract AmpoHook is BaseHook {
     // TODO: Add totalSupply
     mapping(PoolId => mapping(address => uint256)) public balances;
 
+    /// @notice How much liquidity is held by the hook on behalf of each user.
+    /// @dev Hook needs to own all the liquidity so that it's able to withdraw it when options are minted.
     mapping(PoolId => mapping(address => uint256)) public liquidity;
 
     /// @notice User's options position size.
@@ -150,7 +159,7 @@ contract AmpoHook is BaseHook {
 
     /// @notice Specify hook permissions. Hook implements `beforeInitialize`, `beforeAddLiquidity`
     /// and `beforeSwap`. `beforeSwapReturnDelta` is also set to charge custom swap fees that go
-    /// to the manager.
+    /// to the manager instead of LPs.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -197,17 +206,21 @@ contract AmpoHook is BaseHook {
             tickUpper: params.tickUpper,
             lpFee: params.lpFee,
             payInTokenZero: params.payInTokenZero,
-            notionalPerLiquidity: 0,
             manager: address(0),
             rent: 0,
             fundingRate: 0,
             cumulativeFunding: 0,
-            lastCumulativeFundingUpdateBlock: 0
+            lastCumulativeFundingUpdateBlock: 0,
+            amount0PerLiquidity: 0,
+            amount1PerLiquidity: 0
         });
 
-        // Precalculate the notional value per liquidity. This is used later on when
-        // users mint or burn options.
-        pools[poolId].notionalPerLiquidity = LiquidityAmounts.getAmount0ForLiquidity(
+        // Precalculate the amounts per liquidity. These values are used later on when users mint or
+        // burn options.
+        pools[poolId].amount0PerLiquidity = LiquidityAmounts.getAmount0ForLiquidity(
+            TickMath.getSqrtPriceAtTick(params.tickLower), TickMath.getSqrtPriceAtTick(params.tickUpper), 1e18
+        );
+        pools[poolId].amount1PerLiquidity = LiquidityAmounts.getAmount1ForLiquidity(
             TickMath.getSqrtPriceAtTick(params.tickLower), TickMath.getSqrtPriceAtTick(params.tickUpper), 1e18
         );
         return this.beforeInitialize.selector;
@@ -499,8 +512,8 @@ contract AmpoHook is BaseHook {
         int256 positionDelta = positionDelta0 + positionDelta1;
         int256 absPositionDelta0 = positionDelta0 > 0 ? positionDelta0 : -positionDelta0;
         int256 absPositionDelta1 = positionDelta1 > 0 ? positionDelta1 : -positionDelta1;
-        uint256 notional0 = absPositionDelta0.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
-        uint256 notional1 = absPositionDelta1.toUint256() * pools[key.toId()].notionalPerLiquidity / 1e18;
+        uint256 notional0 = absPositionDelta0.toUint256() * pools[key.toId()].amount0PerLiquidity / 1e18;
+        uint256 notional1 = absPositionDelta1.toUint256() * pools[key.toId()].amount1PerLiquidity / 1e18;
 
         // Modify liquidity owned by the hook, equivalent to minting or burning options
         delta = abi.decode(
