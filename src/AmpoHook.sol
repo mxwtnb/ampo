@@ -65,24 +65,19 @@ contract AmpoHook is BaseHook {
     error OnlyManager();
 
     /// @notice Parameters that need to be specified when initializing a pool.
-    /// `tickLower` and `tickUpper` determine a concentrated liquidity range that all LP deposits
-    /// must use. They correspond to the strike price of the call and put options minted from
-    /// the pool. The range should be wide enough to reliably capture fees when the price is in that
-    /// area but narrow enough to provide enough leverage. `lpFee` is the fixed LP fee as a multiple
-    /// of 1_000_000. `payInTokenZero` determines whether rent and funding are paid in token0 or token1.
+    /// `tickLower` and `tickUpper` specify a concentrated range that all LP deposits must use.
+    /// They correspond to the strike price of the call and put options minted from the pool.
+    /// The range should be wide enough to reliably capture fees when the price is in that
+    /// area but narrow enough to provide enough leverage.
     /// @dev Dynamic fee flag needs to be set in the pool key so we have to pass in the `lpFee` here.
     struct InitializeParams {
-        int24 tickLower;
-        int24 tickUpper;
-        uint24 lpFee;
-        bool payInTokenZero;
+        int24 tickLower; // Lower tick of the fixed liquidity range
+        int24 tickUpper; // Upper tick of the fixed liquidity range
+        uint24 lpFee; // Fixed LP fee as a multiple of 1_000_000
+        bool payInTokenZero; // Whether rent and funding are paid in token0 or token1
     }
 
-    /// @notice State stored for each pool
-    /// `amount0PerLiquidity` and `amount1PerLiquidity` are the amounts of token0 and token1 an LP
-    /// position with 1e18 liquidity would hold if it contains only token0 or token1 respectively.
-    /// These values are precalculated in `beforeInitialize` and used when minting or burning options
-    /// to calculate how many tokens are held in each option.
+    /// @notice State stored for each pool.
     struct PoolState {
         int24 tickLower;
         int24 tickUpper;
@@ -93,11 +88,11 @@ contract AmpoHook is BaseHook {
         uint256 fundingRate; // Amount paid per block per option by option holders to the manager
         uint256 cumulativeFunding; // Keeps track of the sum of `fundingRate` across all blocks
         uint256 lastCumulativeFundingUpdateBlock; // Last block `cumulativeFunding` was updated
-        uint256 amount0PerLiquidity;
-        uint256 amount1PerLiquidity;
+        uint256 amount0PerLiquidity; // Amount of token0 per 1e18 liquidity
+        uint256 amount1PerLiquidity; // Amount of token1 per 1e18 liquidity
     }
 
-    /// @notice Data passed to `PoolManager.unlock` when modifying liquidity
+    /// @notice Data passed to `PoolManager.unlock` when modifying liquidity.
     struct CallbackData {
         PoolKey key;
         address sender;
@@ -376,12 +371,12 @@ contract AmpoHook is BaseHook {
     /// @notice Called by a user to modify their options position in a pool. There are two types of
     /// options supported: token0 calls and token1 calls. `positionDelta0` and `positionDelta1` are
     /// used to modify the user's position in each type of option. Positive values mean open position
-    /// (or buy/mint) and negative values mean close or exercise the position (or sell/burn).
+    /// and negative values mean close or exercise the position.
     /// Note that put options are also supported. A token0 put is equivalent to a token1 call and a
     /// token1 put is equivalent to a token0 call.
     /// @param key The pool to modify the position in
-    /// @param positionDelta0 The change in position0 - positive means buy and negative means sell
-    /// @param positionDelta1 The change in position1 - positive means buy and negative means sell
+    /// @param positionDelta0 The change in position0
+    /// @param positionDelta1 The change in position1
     /// @return delta The change in the user's balance in the two tokens
     function modifyOptionsPosition(PoolKey calldata key, int256 positionDelta0, int256 positionDelta1)
         external
@@ -588,7 +583,8 @@ contract AmpoHook is BaseHook {
         }
     }
 
-    /// @notice Calculate user's balance in a pool accounting for rent and funding payments
+    /// @notice Calculate rent and funding owed by a user in a pool since the last time these were
+    /// deducted from the `balanceOf` variable.
     function _calcRentOwedAndFundingOwed(PoolKey calldata key, address user)
         internal
         view
@@ -614,7 +610,6 @@ contract AmpoHook is BaseHook {
     /// @notice Calculate the cumulative funding of a pool. This is the sum of the funding rate
     /// across all blocks in the past. For example, if the current funding rate is 0.0001, after 100 blocks the
     /// cumulative funding would increase by 0.01.
-    /// @param key The pool to calculate cumulative funding for
     function _calcCumulativeFunding(PoolKey calldata key) internal view returns (uint256) {
         PoolState storage pool = pools[key.toId()];
         uint256 blocksSinceLastUpdate = block.number - pool.lastCumulativeFundingUpdateBlock;

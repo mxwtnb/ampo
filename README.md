@@ -4,7 +4,7 @@ A Uniswap V4 hook that lets users trade perpetual options.
 
 ### Background
 
-This was built and submitted for the [Hookathon C1](https://learnweb3.learnweb3.io/hackathons/hookathon-c1/), a hackathon for Uniswap V4 hooks.
+This project was built and submitted for the [Hookathon C1](https://learnweb3.learnweb3.io/hackathons/hookathon-c1/), a hackathon for Uniswap V4 hooks.
 
 Feel free to check out the [accompanying slides](https://docs.google.com/presentation/d/1xeaBmTHIDDWf5YchmquMXHaOp3F_LkDre-ubl_WtfKI/) for an overview of the motivation behind the project as well as how the mechanism works.
 
@@ -14,15 +14,15 @@ All functionality is built into a single hook contract in `src/AmpoHook.sol`. Un
 
 The main public methods in the AmpoHook contract:
 
-**bid()**: called by potential managers to place bids
+**bid()**: Called by potential managers to place bids
 
-**deposit(), withdraw()**: deposit or withdraw collateral from contract. collateral is used to pay rent or funding
+**deposit(), withdraw()**: Deposit or withdraw collateral from contract. Collateral is used to pay rent or funding
 
-**modifyLiquidity()**: deposit or withdraw liquidity in underlying pool
+**modifyLiquidity()**: Deposit or withdraw liquidity in underlying pool
 
-**setFundingRate()**: called by manager to change funding rate
+**setFundingRate()**: Called by manager to change funding rate
 
-**modifyOptionsPosition()**: called by traders to open or close options positions
+**modifyOptionsPosition()**: Called by traders to open or close options positions
 
 ## Mechanism
 
