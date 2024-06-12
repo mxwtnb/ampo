@@ -342,7 +342,7 @@ contract AmpoHook is BaseHook {
         // Calculate new position. Ensure it's positive, i.e. the user is not withdrawing more than they deposited
         int256 liquidity_ = liquidityOf[key.toId()][msg.sender].toInt256() + liquidityDelta;
         if (liquidity_ < 0) revert CannotWithdrawMoreThanDeposited();
-        liquidityOf[key.toId()][msg.sender] = liquidity_.toUint256();
+        liquidityOf[key.toId()][msg.sender] = uint256(liquidity_);
 
         // Sweep any native ETH balance to the user
         uint256 ethBalance = address(this).balance;
