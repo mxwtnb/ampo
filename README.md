@@ -1,12 +1,6 @@
 ## Auction-managed perpetual options
 
-A Uniswap V4 hook that lets users trade perpetual options.
-
-### Background
-
-This project was built and submitted for the [Hookathon C1](https://learnweb3.learnweb3.io/hackathons/hookathon-c1/), a hackathon for Uniswap V4 hooks.
-
-Feel free to check out the [accompanying slides](https://docs.google.com/presentation/d/1xeaBmTHIDDWf5YchmquMXHaOp3F_LkDre-ubl_WtfKI/) for an overview of the motivation behind the project as well as how the mechanism works.
+A proof-of-concept Uniswap V4 hook that lets users trade perpetual options.
 
 ## Overview
 
